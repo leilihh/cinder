@@ -70,7 +70,13 @@ class API(base.Base):
 
         # Don't allow backup to be deleted if there are incremental
         # backups dependent on it.
-        deltas = self.get_all(context, {'parent_id': backup['id']})
+        backups = self.get_all(context, {'parent_id': backup['id']})
+        # NOTE(Sunny): The filter in "self.get_all()" doesn't work,
+        #              so add the following logic to filter backup list.
+        deltas = []
+        for item in backups:
+            if item.get('parent_id', None):
+                deltas.append(item)
         if deltas and len(deltas):
             msg = _('Incremental backups exist for this backup.')
             raise exception.InvalidBackup(reason=msg)
