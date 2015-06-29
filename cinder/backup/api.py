@@ -35,7 +35,6 @@ import cinder.policy
 from cinder import quota
 from cinder import utils
 import cinder.volume
-from cinder.volume import utils as volume_utils
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)

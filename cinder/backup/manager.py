@@ -50,7 +50,6 @@ from cinder.openstack.common import log as logging
 from cinder import quota
 from cinder import rpc
 from cinder import utils
-from cinder.volume import utils as volume_utils
 
 LOG = logging.getLogger(__name__)
 

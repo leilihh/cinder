@@ -49,8 +49,7 @@ import subprocess
 import time
 
 import eventlet
-from oslo_config import cfg
-from oslo_log import log as logging
+from oslo.config import cfg
 from oslo_utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import units
@@ -58,6 +57,7 @@ from oslo_utils import units
 from cinder.backup import driver
 from cinder import exception
 from cinder.i18n import _, _LE, _LI, _LW
+from cinder.openstack.common import log as logging
 from cinder import utils
 import cinder.volume.drivers.rbd as rbd_driver
 
