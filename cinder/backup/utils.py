@@ -46,3 +46,18 @@ def extract_host(host, level='backend', default_pool_name=False):
             return DEFAULT_POOL_NAME
         else:
             return None
+
+def notify_about_backup_usage(context, backup, event_suffix,
+                              extra_usage_info=None,
+                              host=None):
+    if not host:
+        host = CONF.host
+
+    if not extra_usage_info:
+        extra_usage_info = {}
+
+    usage_info = _usage_from_backup(context, backup, **extra_usage_info)
+
+    rpc.get_notifier("backup", host).info(context, 'backup.%s' % event_suffix,
+                                          usage_info)
+

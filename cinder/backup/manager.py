@@ -261,7 +261,7 @@ class BackupManager(manager.SchedulerDependentManager):
                      'volume: %(volume_id)s.'),
                  {'backup_id': backup_id, 'volume_id': volume_id})
 
-        self._notify_about_backup_usage(context, backup, "create.start")
+        #self._notify_about_backup_usage(context, backup, "create.start")
         volume_host = volume_utils.extract_host(volume['host'], 'backend')
         backend = self._get_volume_backend(host=volume_host)
 
