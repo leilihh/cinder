@@ -17,15 +17,15 @@
 
 import abc
 
-from oslo_config import cfg
-from oslo_log import log as logging
-from oslo_serialization import jsonutils
+from oslo.config import cfg
+from oslo.serialization import jsonutils
 import six
 
 from cinder.db import base
 from cinder import exception
 from cinder.i18n import _, _LI, _LW
 from cinder import keymgr
+from cinder.openstack.common import log as logging
 
 service_opts = [
     cfg.IntOpt('backup_metadata_version', default=2,
