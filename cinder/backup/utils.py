@@ -3,6 +3,12 @@ __author__ = 'psteam'
 DEFAULT_POOL_NAME = '_pool0'
 
 
+from cinder import rpc
+from oslo.config import cfg
+CONF = cfg.CONF
+
+
+
 def extract_host(host, level='backend', default_pool_name=False):
     """Extract Host, Backend or Pool information from host string.
 
@@ -46,6 +52,26 @@ def extract_host(host, level='backend', default_pool_name=False):
             return DEFAULT_POOL_NAME
         else:
             return None
+
+
+def _usage_from_backup(context, backup_ref, **kw):
+    usage_info = dict(tenant_id=backup_ref['project_id'],
+                      user_id=backup_ref['user_id'],
+                      availability_zone=backup_ref['availability_zone'],
+                      backup_id=backup_ref['id'],
+                      host=backup_ref['host'],
+                      display_name=backup_ref['display_name'],
+                      created_at=str(backup_ref['created_at']),
+                      status=backup_ref['status'],
+                      volume_id=backup_ref['volume_id'],
+                      size=backup_ref['size'],
+                      service_metadata=backup_ref['service_metadata'],
+                      service=backup_ref['service'],
+                      fail_reason=backup_ref['fail_reason'])
+
+    usage_info.update(kw)
+    return usage_info
+
 
 def notify_about_backup_usage(context, backup, event_suffix,
                               extra_usage_info=None,
