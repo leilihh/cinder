@@ -47,7 +47,6 @@ from cinder import exception
 from cinder.i18n import _, _LE, _LI, _LW
 from cinder import manager
 from cinder.openstack.common import log as logging
-from cinder import quota
 from cinder import rpc
 from cinder import utils
 
@@ -67,7 +66,6 @@ mapper = {'cinder.backup.services.swift': 'cinder.backup.drivers.swift',
 
 CONF = cfg.CONF
 CONF.register_opts(backup_manager_opts)
-QUOTAS = quota.QUOTAS
 
 
 class BackupManager(manager.SchedulerDependentManager):
@@ -462,26 +460,8 @@ class BackupManager(manager.SchedulerDependentManager):
                                            'fail_reason':
                                            six.text_type(err)})
 
-        # Get reservations
-        try:
-            reserve_opts = {
-                'backups': -1,
-                'backup_gigabytes': -backup['size'],
-            }
-            reservations = QUOTAS.reserve(context,
-                                          project_id=backup['project_id'],
-                                          **reserve_opts)
-        except Exception:
-            reservations = None
-            LOG.exception(_LE("Failed to update usages deleting backup"))
-
         context = context.elevated()
         self.db.backup_destroy(context, backup_id)
-
-        # Commit the reservations
-        if reservations:
-            QUOTAS.commit(context, reservations,
-                          project_id=backup['project_id'])
 
         LOG.info(_LI('Delete backup finished, backup %s deleted.'), backup_id)
         self._notify_about_backup_usage(context, backup, "delete.end")
