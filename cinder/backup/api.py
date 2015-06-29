@@ -85,11 +85,10 @@ class API(base.Base):
             search_opts = {}
         check_policy(context, 'get_all')
         if context.is_admin:
-            backups = self.db.backup_get_all(context, filters=search_opts)
+            backups = self.db.backup_get_all(context)
         else:
             backups = self.db.backup_get_all_by_project(context,
-                                                        context.project_id,
-                                                        filters=search_opts)
+                                                        context.project_id)
 
         return backups
 
