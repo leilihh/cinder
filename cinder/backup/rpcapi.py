@@ -18,10 +18,10 @@ Client side of the volume backup RPC API.
 """
 
 
-from oslo.config import cfg
-from oslo import messaging
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
 
-from cinder.openstack.common import log as logging
 from cinder import rpc
 
 
@@ -78,13 +78,22 @@ class BackupAPI(object):
                       backup_url,
                       backup_hosts):
         LOG.debug("import_record rpcapi backup id %(id)s "
-                  "on host %(host)s "
-                  "for backup_url %(url)s." % {'id': backup_id,
-                                               'host': host,
-                                               'url': backup_url})
+                  "on host %(host)s for backup_url %(url)s.",
+                  {'id': backup_id,
+                   'host': host,
+                   'url': backup_url})
         cctxt = self.client.prepare(server=host)
         cctxt.cast(ctxt, 'import_record',
                    backup_id=backup_id,
                    backup_service=backup_service,
                    backup_url=backup_url,
                    backup_hosts=backup_hosts)
+
+    def reset_status(self, ctxt, host, backup_id, status):
+        LOG.debug("reset_status in rpcapi backup_id %(id)s "
+                  "on host %(host)s.",
+                  {'id': backup_id,
+                   'host': host})
+        cctxt = self.client.prepare(server=host)
+        return cctxt.cast(ctxt, 'reset_status', backup_id=backup_id,
+                          status=status)
