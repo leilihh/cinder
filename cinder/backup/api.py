@@ -101,8 +101,7 @@ class API(base.Base):
         topic = CONF.backup_topic
         ctxt = context.get_admin_context()
         services = self.db.service_get_all_by_topic(ctxt,
-                                                    topic,
-                                                    disabled=False)
+                                                    topic)
         for srv in services:
             if (srv['availability_zone'] == volume['availability_zone'] and
                     srv['host'] == volume_host and
