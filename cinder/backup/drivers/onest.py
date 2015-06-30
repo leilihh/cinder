@@ -201,7 +201,9 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def delete_object(self, container, object_name):
         """Deletes a backup object from a onest object store."""
-        pass
+        if not self.conn.delete_object(container, object_name):
+            LOG.error('failed to delete obejct: %s'
+                      % object_name)
 
     def _generate_object_name_prefix(self, backup):
         """Generates a onest backup object name prefix."""
