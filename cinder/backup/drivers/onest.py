@@ -172,7 +172,10 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def put_container(self, container):
         """Create the container if needed. No failure if it pre-exists."""
-        pass
+        ret = self.conn.create_bucket(container)
+        if ret == False:
+            LOG.error(_LE('failed to create bucket %s'), container)
+        return
 
     def get_container_entries(self, container, prefix):
         """Get container entry names"""
