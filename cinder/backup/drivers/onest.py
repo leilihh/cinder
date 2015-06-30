@@ -28,7 +28,6 @@
                                None (to disable), zlib and bz2 (default: zlib)
 """
 
-import socket
 
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -179,11 +178,11 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def get_container_entries(self, container, prefix):
         """Get container entry names"""
-        try:
-            # response = self.conn.list_objects_of_bucket(container, options={'prefix': prefix})
-            response = self.conn.list_objects_of_bucket(container)
-        except socket.error as err:
-            raise exception.OnestConnectionFailed(reason=err)
+        # response = self.conn.list_objects_of_bucket(container, options={'prefix': prefix})
+        response = self.conn.list_objects_of_bucket(container)
+        if response == None:
+            LOG.error(_LE('failed to get object list of containter %s'), container)
+
         onest_object_names = [item.object_uri for item in response.entries]
         return onest_object_names
 
