@@ -75,7 +75,7 @@ class API(base.Base):
         #              so add the following logic to filter backup list.
         deltas = []
         for item in backups:
-            if item.get('parent_id', None):
+            if item.get('parent_id', None) == backup['id']:
                 deltas.append(item)
         if deltas and len(deltas):
             msg = _('Incremental backups exist for this backup.')
