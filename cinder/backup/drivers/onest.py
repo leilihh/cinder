@@ -33,21 +33,46 @@ from oslo_log import log as logging
 
 from cinder.backup import chunkeddriver
 
+import onest_client
+import onest_common
+import httplib
+import sys
+import threading
+
+
 LOG = logging.getLogger(__name__)
 
 onestbackup_service_opts = [
-    cfg.StrOpt('backup_onest_url',
+    cfg.StrOpt('backup_onest_host',
                default=None,
-               help='The URL of the oNest endpoint'),
-    cfg.StrOpt('backup_onest_user',
-               default=None,
-               help='oNest user name'),
+               help='The VIP of the oNest master host'),
+    cfg.StrOpt('protocol_version',
+               default='CMCC',
+               help='AUTH_PROTOCOL_VERSION for onest'),
+    cfg.StrOpt('backup_onest_accessid',
+               default='CIDC-U-OBSAID-0000017030',
+               help='oNest user accessID'),
     cfg.StrOpt('backup_onest_key',
-               default=None,
-               help='oNest key for authentication'),
+               default='q581kvnkipm6bhclojnvxklsddlphyzywkgrba5i',
+               help='oNest SecretKey for authentication'),
+    cfg.StrOpt('aaa_master_host',
+               default='0.0.0.0',
+               help='oNest aaa master host VIP'),
+    cfg.StrOpt('access_net_mode',
+               default=3,
+               help='oNest access net mode. '
+                    '1 for intrasrvlocation '
+                    '2 for intramgrlocation '
+                    '3 for outerlocation'),
+    cfg.StrOpt('proxy_ip',
+               default='proxy.sgp.hp.com',
+               help='proxy IP address, default to None if no proxy'),
     cfg.StrOpt('backup_onest_container',
                default='volumebackups',
                help='The default oNest container to use'),
+    cfg.IntOpt('proxy_port',
+               default='8080',
+               help="proxy port, default to -1 if no proxy"),
     cfg.IntOpt('backup_onest_object_size',
                default=52428800,
                help='The size in bytes of oNest backup objects'),
@@ -68,6 +93,9 @@ onestbackup_service_opts = [
                      'progress notifications to Ceilometer when backing '
                      'up the volume to the oNest backend storage. The '
                      'default value is True to enable the timer.'),
+    cfg.BoolOpt('is_secure',
+                default=False,
+                help='whether chooses https connection'),
 ]
 
 CONF = cfg.CONF
@@ -87,6 +115,23 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
                                                 backup_default_container,
                                                 enable_progress_timer,
                                                 db_driver)
+
+        self.backup_onest_host = CONF.backup_onest_host
+        self.onest_protocol_version = CONF.onest_protocol_version
+        self.access_net_mode = CONF.access_net_mode
+        self.backup_onest_accessid = CONF.backup_onest_accessid
+        self.backup_onest_key = CONF.backup_onest_key
+        self.is_secure = CONF.is_secure
+
+        authinfo = onest_common.AuthInfo(self.onest_protocol_version,
+                                         self.backup_onest_accessid,
+                                         self.backup_onest_key,
+                                         self.is_secure,
+                                         self.backup_onest_host,
+                                         self.access_net_mode)
+
+        self.conn = onest_client.OnestClient(authinfo, CONF.proxy_ip, CONF.proxy_port)
+
 
     class OnestObjectWriter(object):
         def __init__(self, container, object_name, conn):
