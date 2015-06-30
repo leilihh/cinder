@@ -210,7 +210,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def update_container_name(self, backup, container):
         """Use the container name as provided - don't update."""
-        pass
+        return container
 
     def get_extra_metadata(self, backup, volume):
         """onest driver does not use any extra metadata."""
