@@ -720,3 +720,7 @@ class BrocadeZoningCliException(CinderException):
 
 class NetAppDriverException(VolumeDriverException):
     message = _("NetApp Cinder Driver exception.")
+
+
+class OnestConnectionFailed(BackupDriverException):
+    message = _("Connection to onest failed: %(reason)s")

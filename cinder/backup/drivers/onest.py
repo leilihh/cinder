@@ -28,10 +28,13 @@
                                None (to disable), zlib and bz2 (default: zlib)
 """
 
+import socket
+
 from oslo_config import cfg
 from oslo_log import log as logging
 
 from cinder.backup import chunkeddriver
+from cinder import exception
 
 import onest_client
 import onest_common
@@ -173,7 +176,13 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def get_container_entries(self, container, prefix):
         """Get container entry names"""
-        pass
+        try:
+            # response = self.conn.list_objects_of_bucket(container, options={'prefix': prefix})
+            response = self.conn.list_objects_of_bucket(container)
+        except socket.error as err:
+            raise exception.OnestConnectionFailed(reason=err)
+        onest_object_names = [item.object_uri for item in response.entries]
+        return onest_object_names
 
     def get_object_writer(self, container, object_name, extra_metadata=None):
         """Returns a writer object that stores a chunk of volume data in a
