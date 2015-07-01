@@ -172,6 +172,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
                                              self.object_name)
             if data == None:
                 LOG.error(_LE("failed to get object: %s"), self.object_name)
+                raise
             return data
 
     def put_container(self, container):
@@ -179,6 +180,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
         ret = self.conn.create_bucket(container)
         if ret == False:
             LOG.error(_LE('failed to create bucket %s'), container)
+            raise
         return
 
     def get_container_entries(self, container, prefix):
@@ -187,6 +189,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
         response = self.conn.list_objects_of_bucket(container)
         if response == None:
             LOG.error(_LE('failed to get object list of containter %s'), container)
+            raise
 
         onest_object_names = [item.object_uri for item in response.entries]
         return onest_object_names
@@ -208,6 +211,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
         if not self.conn.delete_object(container, object_name):
             LOG.error('failed to delete obejct: %s'
                       % object_name)
+            raise
 
     def _generate_object_name_prefix(self, backup):
         """Generates a onest backup object name prefix."""
