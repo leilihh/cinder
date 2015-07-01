@@ -168,7 +168,11 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
             pass
 
         def read(self):
-            pass
+            data = self.conn.get_object_data(self.container,
+                                             self.object_name)
+            if data == None:
+                LOG.error(_LE("failed to get object: %s"), self.object_name)
+            return data
 
     def put_container(self, container):
         """Create the container if needed. No failure if it pre-exists."""
