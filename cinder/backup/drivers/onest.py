@@ -29,17 +29,18 @@
 """
 
 
-from oslo_config import cfg
-from oslo_log import log as logging
+from oslo.config import cfg
+from cinder.i18n import _, _LE
+from cinder.openstack.common import log as logging
 
 from cinder.backup import chunkeddriver
 from cinder import exception
 
+import hashlib
 import onest_client
 import onest_common
-import httplib
 import sys
-import threading
+import six
 
 
 LOG = logging.getLogger(__name__)
