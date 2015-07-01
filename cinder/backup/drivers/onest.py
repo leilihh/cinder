@@ -30,6 +30,7 @@
 
 
 from oslo.config import cfg
+from oslo_utils import timeutils
 from cinder.i18n import _, _LE
 from cinder.openstack.common import log as logging
 
@@ -215,7 +216,13 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def _generate_object_name_prefix(self, backup):
         """Generates a onest backup object name prefix."""
-        pass
+        az = 'az_%s' % self.az
+        backup_name = '%s_backup_%s' % (az, backup['id'])
+        volume = 'volume_%s' % (backup['volume_id'])
+        timestamp = timeutils.strtime(fmt="%Y%m%d%H%M%S")
+        prefix = volume + '/' + timestamp + '/' + backup_name
+        LOG.debug('generate_object_name_prefix: %s', prefix)
+        return prefix
 
     def update_container_name(self, backup, container):
         """Use the container name as provided - don't update."""
