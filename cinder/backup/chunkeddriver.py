@@ -28,8 +28,8 @@ import os
 
 import eventlet
 from oslo.config import cfg
-from oslo_utils import excutils
-from oslo_utils import units
+from oslo.utils import excutils
+from oslo.utils import units
 import six
 
 from cinder.backup import driver

@@ -148,42 +148,46 @@ class OnestClient:
                 return True
 
 #object operate
-    def put_object(self, bucket, key, objdata, is_cinder):
+    def put_object_data(self, bucket, key, objdata):
         location = self.get_location(bucket)
         if location =='':
             return False
         else:
             authinfo2 = self.resetLocation(location);
-            # As the put_object API interface required in cinder backup
-            # is quite different from the original oNest python SDK API,
-            # so we add a parameter here to be able to send data directly
-            # rather than an file descriptor and path. The parameter 'objdata'
-            # means data in the case of calling by cinder.
-            if is_cinder:
-                resp = onest_common.Response(
-                           onest_common._make_request(authinfo2,
-                               'PUT',
-                               bucket,
-                               key,
-                               {},
-                               {},
-                               objdata))
-            else:
-                f = file(objdata)
-                obj = onest_common.OnestObject(f, {})
-                resp = onest_common.Response(
-                        onest_common._make_request(authinfo2,
-                            'PUT',
-                            bucket,
-                            key,
-                            {},
-                            {},
-                            obj.data
-                            ))
+            f = file(objdata)
+            obj = onest_common.OnestObject(f, {})
+            resp = onest_common.Response(
+                    onest_common._make_request(authinfo2,
+                        'PUT',
+                        bucket,
+                        key,
+                        {},
+                        {},
+                        obj.data
+                        ))
             f.close()
             if resp.http_response.status != 201:
                 return False
             else :
+                return True
+
+    def put_object(self, bucket, key, objdata):
+        location = self.get_location(bucket)
+        if location =='':
+            return False
+        else:
+            authinfo2 = self.resetLocation(location);
+            resp = onest_common.Response(onest_common._make_request(authinfo2,
+                                                                    'PUT',
+                                                                    bucket,
+                                                                    key,
+                                                                    {},
+                                                                    {},
+                                                                    objdata))
+
+            if resp.http_response.status != 201:
+                return False
+            else:
                 return True
 
     def get_object_meta(self, bucket, key):

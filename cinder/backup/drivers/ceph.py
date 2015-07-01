@@ -50,7 +50,7 @@ import time
 
 import eventlet
 from oslo.config import cfg
-from oslo_utils import encodeutils
+from oslo.utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import units
 

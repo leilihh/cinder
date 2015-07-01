@@ -39,7 +39,7 @@ import hashlib
 import socket
 
 from oslo.config import cfg
-from oslo_utils import timeutils
+from oslo.utils import timeutils
 import six
 from swiftclient import client as swift
 

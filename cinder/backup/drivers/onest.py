@@ -30,7 +30,7 @@
 
 
 from oslo.config import cfg
-from oslo_utils import timeutils
+from oslo.utils import timeutils
 from cinder.i18n import _, _LE
 from cinder.openstack.common import log as logging
 
@@ -140,7 +140,9 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
                                          self.backup_onest_host,
                                          self.access_net_mode)
 
-        self.conn = onest_client.OnestClient(authinfo, CONF.proxy_ip, CONF.proxy_port)
+        self.conn = onest_client.OnestClient(authinfo,
+                                             CONF.proxy_ip,
+                                             CONF.proxy_port)
 
 
     class OnestObjectWriter(object):
@@ -160,7 +162,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
             self.data += data
 
         def close(self):
-            ret = self.conn.put_object(container, object_name,
+            ret = self.conn.put_object(self.container, self.object_name,
                                        self.data, CONF.is_cinder_integration)
             # Swift ensures data consistency put to it by checking md5 digest
             # between returned etag and local md5 as internal control method
@@ -168,7 +170,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
             # The oNest object storage SDK do not have such mechanism, so just
             # rely on the return value 'True' or 'False' as whether its request
             # success or not.
-            if ret == False:
+            if not ret:
                 LOG.error(_LE('failed to put object: %s'), self.object_name)
                 raise
 
@@ -192,7 +194,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
         def read(self):
             data = self.conn.get_object_data(self.container,
                                              self.object_name)
-            if data == None:
+            if not data:
                 LOG.error(_LE("failed to get object: %s"), self.object_name)
                 raise
             return data
@@ -200,7 +202,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
     def put_container(self, container):
         """Create the container if needed. No failure if it pre-exists."""
         ret = self.conn.create_bucket(container)
-        if ret == False:
+        if not ret:
             LOG.error(_LE('failed to create bucket %s'), container)
             raise
         return
@@ -209,7 +211,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
         """Get container entry names"""
         # response = self.conn.list_objects_of_bucket(container, options={'prefix': prefix})
         response = self.conn.list_objects_of_bucket(container)
-        if response == None:
+        if not response:
             LOG.error(_LE('failed to get object list of containter %s'), container)
             raise
 
@@ -231,8 +233,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
     def delete_object(self, container, object_name):
         """Deletes a backup object from a onest object store."""
         if not self.conn.delete_object(container, object_name):
-            LOG.error('failed to delete obejct: %s'
-                      % object_name)
+            LOG.error(_LE('failed to delete object: %s'), object_name)
             raise
 
     def _generate_object_name_prefix(self, backup):

@@ -35,7 +35,7 @@ Volume backups can be created, restored, deleted and listed.
 
 from oslo.config import cfg
 import oslo.messaging as messaging
-from oslo_utils import excutils
+from oslo.utils import excutils
 from oslo_utils import importutils
 import six
 
