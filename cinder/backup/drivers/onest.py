@@ -38,10 +38,11 @@ from cinder.backup import chunkeddriver
 from cinder import exception
 
 import hashlib
-import onest_client
-import onest_common
+from onest import onest_client
+from onest import onest_common
 import sys
 import six
+import os
 
 
 LOG = logging.getLogger(__name__)
@@ -151,10 +152,26 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
             self.close()
 
         def write(self, data):
-            pass
+            self.data += data
 
         def close(self):
-            pass
+            path = os.path.join(self.backup_path, container, object_name)
+
+            ret = self.conn.put_object(container, object_name, path)
+            # Swift ensures data consistency put to it by checking md5 digest
+            # between returned etag and local md5 as internal control method
+            # here.
+            # The oNest object storage SDK do not have such mechanism, so just
+            # rely on the return value 'True' or 'False' as whether its request
+            # success or not.
+            if ret == False:
+                LOG.error(_LE('failed to put object: %s'), self.object_name)
+                raise
+
+            # As the original method returns md5 of the data put into the
+            # swift, return it as well for now.
+            md5 = hashlib.md5(self.data).hexdigest()
+            return md5
 
     class OnestObjectReader(object):
         def __init__(self, container, object_name, conn):
