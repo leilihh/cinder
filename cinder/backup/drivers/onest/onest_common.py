@@ -1,12 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import base64
-import hmac
 import httplib
-import re
-import sha
-import sys
 import time
 import urllib
 import urlparse
@@ -27,7 +22,7 @@ def query_args_hash_to_string(query_args):
     pairs = []
     for k, v in query_args.items():
         piece = k
-        if v != None:
+        if v is not None:
             piece += "=%s" % urllib.quote_plus(str(v))
         pairs.append(piece)
 
@@ -70,10 +65,7 @@ def _gen_access_url_signature(method, bucket, key, accessSecretkey, headers):
     if key != '':
         strToSign += '/' + key
 
-    # if len(query_args):
-    # strToSign += "?" + query_args_hash_to_string(query_args)
-
-    print  strToSign
+    print strToSign
     signature = hmac_sha1.hmac_sha1(strToSign, accessSecretkey)
 
     return signature
@@ -107,16 +99,15 @@ def _add_onest_auth_header(authinfo, headers, method, bucket, key, query_args):
     if key != '':
         strToSign += '/' + key
 
-    # if len(query_args):
-    # strToSign += "?" + query_args_hash_to_string(query_args)
-
-    print  strToSign
+    print strToSign
     signature = hmac_sha1.hmac_sha1(strToSign, authinfo.accessSecretkey)
 
-    headers['Authorization'] = "%s %s:%s" % (authinfo.auth_protocol_version, authinfo.accessID, signature )
+    headers['Authorization'] = "%s %s:%s" % (
+    authinfo.auth_protocol_version, authinfo.accessID, signature)
 
 
-def _make_request(authinfo, method, bucket='', key='', query_args={}, headers={}, data='', metadata={}):
+def _make_request(authinfo, method, bucket='', key='', query_args={},
+                  headers={}, data='', metadata={}):
     headers['Host'] = authinfo.host
     headers['Date'] = time.strftime(GMT_FORMAT, time.gmtime(time.time()))
     if data == '':
@@ -131,18 +122,23 @@ def _make_request(authinfo, method, bucket='', key='', query_args={}, headers={}
         path += "?" + query_args_hash_to_string(query_args)
 
     is_secure = authinfo.is_secure
-    # server = authinfo.server
-    # host = "%s:%d" % (server, authinfo.port)
+
     while True:
-        if PROXY_INFO is None:  # 非代理模式
-            connection = is_secure and httplib.HTTPSConnection(authinfo.host) or httplib.HTTPConnection(authinfo.host)
-        else:  # 代理模式
-            connection = httplib.HTTPConnection(PROXY_INFO.proxy_ip, PROXY_INFO.proxy_port)
-            path = is_secure and "https://" + authinfo.host + path or "http://" + authinfo.host + path
+        # non-proxy mode
+        if PROXY_INFO is None:
+            connection = is_secure and httplib.HTTPSConnection(
+                authinfo.host) or httplib.HTTPConnection(authinfo.host)
+        # proxy mode
+        else:
+            connection = httplib.HTTPConnection(PROXY_INFO.proxy_ip,
+                                                PROXY_INFO.proxy_port)
+            path = is_secure and "https://" + authinfo.host + path or \
+                "http://" + authinfo.host + path
 
         final_headers = merge_meta(headers, metadata)
         # add auth header
-        _add_onest_auth_header(authinfo, final_headers, method, bucket, key, query_args)
+        _add_onest_auth_header(authinfo, final_headers, method, bucket, key,
+                               query_args)
 
         print method
         print authinfo.host
@@ -161,17 +157,20 @@ def _make_request(authinfo, method, bucket='', key='', query_args={}, headers={}
             return resp
         # (close connection)
         resp.read()
-        scheme, host, path, params, query, fragment = urlparse.urlparse(location)
+        scheme, host, path, params, query, fragment = urlparse.urlparse(
+            location)
         if scheme == "http":
             is_secure = True
         elif scheme == "https":
             is_secure = False
         # else: raise invalidURL("Not http/https: " + location)
-        if query: path += "?" + query
+        if query:
+            path += "?" + query
         # retry with redirect
 
 
-def _anony_make_request(authinfo, method, bucket='', key='', query_args={}, headers={}, data='', metadata={}):
+def _anony_make_request(authinfo, method, bucket='', key='', query_args={},
+                        headers={}, data='', metadata={}):
     headers['Host'] = authinfo.host
     headers['Date'] = time.strftime(GMT_FORMAT, time.gmtime(time.time()))
     if data == '':
@@ -186,19 +185,19 @@ def _anony_make_request(authinfo, method, bucket='', key='', query_args={}, head
         path += "?" + query_args_hash_to_string(query_args)
 
     is_secure = authinfo.is_secure
-    # server = authinfo.server
-    # host = "%s:%d" % (server, authinfo.port)
     while True:
-        if PROXY_INFO is None:  # 非代理模式
-            connection = is_secure and httplib.HTTPSConnection(authinfo.host) or httplib.HTTPConnection(authinfo.host)
-        else:  # 代理模式
-            connection = httplib.HTTPConnection(PROXY_INFO.proxy_ip, PROXY_INFO.proxy_port)
-            path = is_secure and "https://" + authinfo.host + path or "http://" + authinfo.host + path
+        # non-proxy mode
+        if PROXY_INFO is None:
+            connection = is_secure and httplib.HTTPSConnection(
+                authinfo.host) or httplib.HTTPConnection(authinfo.host)
+        # proxy mode
+        else:
+            connection = httplib.HTTPConnection(PROXY_INFO.proxy_ip,
+                                                PROXY_INFO.proxy_port)
+            path = is_secure and "https://" + authinfo.host + path or \
+                "http://" + authinfo.host + path
 
         final_headers = merge_meta(headers, metadata)
-
-        # add auth header
-        # _add_onest_auth_header(authinfo,final_headers, method, bucket, key, query_args)
 
         print method
         print authinfo.host
@@ -217,23 +216,24 @@ def _anony_make_request(authinfo, method, bucket='', key='', query_args={}, head
             return resp
         # (close connection)
         resp.read()
-        scheme, host, path, params, query, fragment = urlparse.urlparse(location)
+        scheme, host, path, params, query, fragment = urlparse.urlparse(
+            location)
         if scheme == "http":
             is_secure = True
         elif scheme == "https":
             is_secure = False
         # else: raise invalidURL("Not http/https: " + location)
-        if query: path += "?" + query
+        if query:
+            path += "?" + query
         # retry with redirect
 
 
 class AuthInfo:
-    def __init__(self, auth_protocol_version, accessID, accessSecretkey, is_secure, host, access_net_mode):
+    def __init__(self, auth_protocol_version, accessID, accessSecretkey,
+                 is_secure, host, access_net_mode):
         self.auth_protocol_version = auth_protocol_version
         self.accessID = accessID
         self.accessSecretkey = accessSecretkey
-        # self.server = server
-        # self.port = port
         self.is_secure = is_secure
         self.host = host
         self.access_net_mode = access_net_mode
@@ -263,13 +263,15 @@ class Response:
         if http_response.status >= 300 and self.body:
             self.message = self.body
         else:
-            self.message = "%03d %s" % (http_response.status, http_response.reason)
+            self.message = "%03d %s" % (http_response.status,
+                                        http_response.reason)
 
 
 class GetResponse(Response):
     def __init__(self, http_response):
         Response.__init__(self, http_response)
-        response_headers = http_response.msg  # older pythons don't have getheaders
+        response_headers = http_response.msg  # older pythons don't have
+        # getheaders
         metadata = self.get_onest_metadata(response_headers)
         self.object = OnestObject(self.body, metadata)
 
