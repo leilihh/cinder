@@ -88,7 +88,7 @@ onestbackup_service_opts = [
                     'has to be multiple of backup_onest_block_size.'),
     cfg.IntOpt('backup_onest_retry_attempts',
                default=3,
-               help='The number of retries to make for oNest operations')
+               help='The number of retries to make for oNest operations'),
     cfg.IntOpt('backup_onest_retry_backoff',
                default=2,
                help='The backoff time in seconds between oNest retries'),
@@ -101,6 +101,11 @@ onestbackup_service_opts = [
     cfg.BoolOpt('is_secure',
                 default=False,
                 help='whether chooses https connection'),
+    cfg.BoolOpt('is_cinder_integration',
+                default=True,
+                help='whether uses the initial oNest python SDK for '
+                     'cinder oNest backup driver as it would need some '
+                     'modification to adjust the current cinder interface.'),
 ]
 
 CONF = cfg.CONF
@@ -155,9 +160,8 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
             self.data += data
 
         def close(self):
-            path = os.path.join(self.backup_path, container, object_name)
-
-            ret = self.conn.put_object(container, object_name, path)
+            ret = self.conn.put_object(container, object_name,
+                                       self.data, CONF.is_cinder_integration)
             # Swift ensures data consistency put to it by checking md5 digest
             # between returned etag and local md5 as internal control method
             # here.
