@@ -38,8 +38,8 @@ from cinder.backup import chunkeddriver
 from cinder import exception
 
 import hashlib
-from onest import onest_client
-from onest import onest_common
+from onest_sdk import onest_client
+from onest_sdk import onest_common
 import sys
 import six
 import os
@@ -51,7 +51,7 @@ onestbackup_service_opts = [
     cfg.StrOpt('backup_onest_host',
                default=None,
                help='The VIP of the oNest master host'),
-    cfg.StrOpt('protocol_version',
+    cfg.StrOpt('onest_protocol_version',
                default='CMCC',
                help='AUTH_PROTOCOL_VERSION for onest'),
     cfg.StrOpt('backup_onest_accessid',
