@@ -28,6 +28,7 @@
                                None (to disable), zlib and bz2 (default: zlib)
 """
 
+# -*- coding: utf-8 -*-
 
 from oslo.config import cfg
 from oslo.utils import timeutils
@@ -44,6 +45,8 @@ import sys
 import six
 import os
 
+reload(sys)
+sys.setdefaultencoding('utf8')
 
 LOG = logging.getLogger(__name__)
 
@@ -161,8 +164,10 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
             self.data += data
 
         def close(self):
+            reader = six.StringIO(self.data)
+
             ret = self.conn.put_object(self.container, self.object_name,
-                                       self.data, CONF.is_cinder_integration)
+                                       reader, content_length=reader.len)
             # Swift ensures data consistency put to it by checking md5 digest
             # between returned etag and local md5 as internal control method
             # here.
@@ -171,7 +176,6 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
             # success or not.
             if not ret:
                 LOG.error(_LE('failed to put object: %s'), self.object_name)
-                raise
 
             # As the original method returns md5 of the data put into the
             # swift, return it as well for now.
@@ -195,7 +199,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
                                              self.object_name)
             if not data:
                 LOG.error(_LE("failed to get object: %s"), self.object_name)
-                raise
+
             return data
 
     def put_container(self, container):
@@ -211,7 +215,6 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
         response = self.conn.list_objects_of_bucket(container)
         if not response:
             LOG.error(_LE('failed to get object list of containter %s'), container)
-            raise
 
         onest_object_names = [item.object_uri for item in response.entries]
         return onest_object_names
@@ -232,7 +235,6 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
         """Deletes a backup object from a onest object store."""
         if not self.conn.delete_object(container, object_name):
             LOG.error(_LE('failed to delete object: %s'), object_name)
-            raise
 
     def _generate_object_name_prefix(self, backup):
         """Generates a onest backup object name prefix."""

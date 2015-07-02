@@ -190,7 +190,7 @@ class OnestClient:
             else:
                 return True
 
-    def put_object(self, bucket, key, objdata):
+    def put_object(self, bucket, key, objdata, content_length=None):
         location = self.get_location(bucket)
         if location == '':
             return False
@@ -202,7 +202,8 @@ class OnestClient:
                                                                     key,
                                                                     {},
                                                                     {},
-                                                                    objdata))
+                                                                    objdata,
+                                                                    content_length))
 
             if resp.http_response.status != 201:
                 return False

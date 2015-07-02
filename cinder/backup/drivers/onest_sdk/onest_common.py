@@ -107,11 +107,14 @@ def _add_onest_auth_header(authinfo, headers, method, bucket, key, query_args):
 
 
 def _make_request(authinfo, method, bucket='', key='', query_args={},
-                  headers={}, data='', metadata={}):
+                  headers={}, data='', content_length=None, metadata={}):
     headers['Host'] = authinfo.host
     headers['Date'] = time.strftime(GMT_FORMAT, time.gmtime(time.time()))
     if data == '':
         headers['Content-Length'] = '0'
+
+    if content_length is not None:
+        headers['Content-Length'] = str(content_length)
 
     path = ''
     path += "/%s" % bucket
@@ -157,6 +160,12 @@ def _make_request(authinfo, method, bucket='', key='', query_args={},
             return resp
         # (close connection)
         resp.read()
+
+        if (isinstance(connection, tuple) and len(connection) > 1):
+            conn = connection[1]
+            if hasattr(conn, 'close') and callable(conn.close):
+                conn.close()
+
         scheme, host, path, params, query, fragment = urlparse.urlparse(
             location)
         if scheme == "http":
