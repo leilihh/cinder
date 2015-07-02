@@ -217,7 +217,13 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
             LOG.error(_LE('failed to get object list of containter %s'), container)
 
         onest_object_names = [item.object_uri for item in response.entries]
-        return onest_object_names
+
+        onest_adjust_obj_names = []
+        for obj_name in onest_object_names:
+            obj_name = obj_name[(len(container) + 1) : ]
+            onest_adjust_obj_names.append(obj_name)    
+
+        return onest_adjust_obj_names
 
     def get_object_writer(self, container, object_name, extra_metadata=None):
         """Returns a writer object that stores a chunk of volume data in a
