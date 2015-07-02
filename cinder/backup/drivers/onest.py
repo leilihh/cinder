@@ -48,9 +48,6 @@ import os
 LOG = logging.getLogger(__name__)
 
 onestbackup_service_opts = [
-    cfg.StrOpt('backup_onest_host',
-               default=None,
-               help='The VIP of the oNest master host'),
     cfg.StrOpt('onest_protocol_version',
                default='CMCC',
                help='AUTH_PROTOCOL_VERSION for onest'),
@@ -61,7 +58,7 @@ onestbackup_service_opts = [
                default='q581kvnkipm6bhclojnvxklsddlphyzywkgrba5i',
                help='oNest SecretKey for authentication'),
     cfg.StrOpt('aaa_master_host',
-               default='0.0.0.0',
+               default='221.176.53.19:8080',
                help='oNest aaa master host VIP'),
     cfg.StrOpt('access_net_mode',
                default=3,
@@ -70,13 +67,15 @@ onestbackup_service_opts = [
                     '2 for intramgrlocation '
                     '3 for outerlocation'),
     cfg.StrOpt('proxy_ip',
-               default='proxy.sgp.hp.com',
+#               default='proxy.sgp.hp.com',
+               default='None',
                help='proxy IP address, default to None if no proxy'),
     cfg.StrOpt('backup_onest_container',
                default='volumebackups',
                help='The default oNest container to use'),
     cfg.IntOpt('proxy_port',
-               default='8080',
+#               default='8080',
+               default='-1',
                help="proxy port, default to -1 if no proxy"),
     cfg.IntOpt('backup_onest_object_size',
                default=52428800,
@@ -126,7 +125,7 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
                                                 enable_progress_timer,
                                                 db_driver)
 
-        self.backup_onest_host = CONF.backup_onest_host
+        self.backup_onest_host = CONF.aaa_master_host
         self.onest_protocol_version = CONF.onest_protocol_version
         self.access_net_mode = CONF.access_net_mode
         self.backup_onest_accessid = CONF.backup_onest_accessid
@@ -201,10 +200,9 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
     def put_container(self, container):
         """Create the container if needed. No failure if it pre-exists."""
-        ret = self.conn.create_bucket(container)
-        if not ret:
-            LOG.error(_LE('failed to create bucket %s'), container)
-            raise
+        # No failure check needed here
+        self.conn.create_bucket(container)
+
         return
 
     def get_container_entries(self, container, prefix):
