@@ -220,8 +220,9 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
 
         onest_adjust_obj_names = []
         for obj_name in onest_object_names:
-            obj_name = obj_name[(len(container) + 1) : ]
-            onest_adjust_obj_names.append(obj_name)    
+            obj_name = obj_name[(len(container) + 1):]
+            if prefix in obj_name:
+                onest_adjust_obj_names.append(obj_name)
 
         return onest_adjust_obj_names
 
