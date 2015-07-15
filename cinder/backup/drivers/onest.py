@@ -43,7 +43,7 @@ from onest_sdk import onest_client
 from onest_sdk import onest_common
 import sys
 import six
-import os
+
 
 reload(sys)
 sys.setdefaultencoding('utf8')
@@ -118,6 +118,8 @@ class OnestBackupDriver(chunkeddriver.ChunkedBackupDriver):
     """Provides backup, restore and delete of backup objects within oNest."""
 
     def __init__(self, context, db_driver=None):
+        LOG.audit(_('  Loading oNest backup driver'))
+
         chunk_size_bytes = CONF.backup_onest_object_size
         sha_block_size_bytes = CONF.backup_onest_block_size
         backup_default_container = CONF.backup_onest_container
