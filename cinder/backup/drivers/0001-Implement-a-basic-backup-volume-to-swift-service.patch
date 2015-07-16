@@ -1,0 +1,3531 @@
+From f50c8cbed1012aac86df2309a944d0e56707b4d6 Mon Sep 17 00:00:00 2001
+From: Duncan Thomas <duncan.thomas@gmail.com>
+Date: Wed, 20 Feb 2013 18:07:55 +0000
+Subject: [PATCH] Implement a basic backup-volume-to-swift service
+
+Implements: blueprint volume-backups
+
+This patch adds the new service, api and basic unit tests
+
+Change-Id: Ibe02c680c5e9201d208c92e796e86ad76b4b54b3
+---
+ .gitignore                                         |   1 +
+ bin/cinder-backup                                  |  47 ++
+ bin/cinder-manage                                  |  37 +
+ cinder/api/contrib/backups.py                      | 278 +++++++
+ cinder/api/views/backups.py                        |  90 +++
+ cinder/backup/__init__.py                          |  23 +
+ cinder/backup/api.py                               | 171 ++++
+ cinder/backup/manager.py                           | 260 +++++++
+ cinder/backup/rpcapi.py                            |  73 ++
+ cinder/backup/services/__init__.py                 |  14 +
+ cinder/backup/services/swift.py                    | 352 +++++++++
+ cinder/db/api.py                                   |  47 +-
+ cinder/db/sqlalchemy/api.py                        |  65 ++
+ .../migrate_repo/versions/008_add_backup.py        | 106 +++
+ cinder/db/sqlalchemy/models.py                     |  29 +-
+ cinder/exception.py                                |   8 +
+ cinder/flags.py                                    |   9 +
+ cinder/tests/api/contrib/test_backups.py           | 856 +++++++++++++++++++++
+ cinder/tests/backup/__init__.py                    |  14 +
+ cinder/tests/backup/fake_service.py                |  41 +
+ cinder/tests/backup/fake_swift_client.py           |  99 +++
+ cinder/tests/fake_flags.py                         |   2 +
+ cinder/tests/test_backup.py                        | 332 ++++++++
+ cinder/tests/test_backup_swift.py                  | 156 ++++
+ cinder/tests/test_migrations.py                    |  62 ++
+ cinder/volume/api.py                               |   3 +-
+ cinder/volume/driver.py                            |   8 +
+ cinder/volume/drivers/lvm.py                       |  15 +
+ etc/cinder/cinder.conf.sample                      |   3 +
+ tools/pip-requires                                 |   1 +
+ 30 files changed, 3199 insertions(+), 3 deletions(-)
+ create mode 100755 bin/cinder-backup
+ create mode 100644 cinder/api/contrib/backups.py
+ create mode 100644 cinder/api/views/backups.py
+ create mode 100644 cinder/backup/__init__.py
+ create mode 100644 cinder/backup/api.py
+ create mode 100755 cinder/backup/manager.py
+ create mode 100644 cinder/backup/rpcapi.py
+ create mode 100644 cinder/backup/services/__init__.py
+ create mode 100644 cinder/backup/services/swift.py
+ create mode 100644 cinder/db/sqlalchemy/migrate_repo/versions/008_add_backup.py
+ create mode 100644 cinder/tests/api/contrib/test_backups.py
+ create mode 100644 cinder/tests/backup/__init__.py
+ create mode 100644 cinder/tests/backup/fake_service.py
+ create mode 100644 cinder/tests/backup/fake_swift_client.py
+ create mode 100644 cinder/tests/test_backup.py
+ create mode 100644 cinder/tests/test_backup_swift.py
+
+diff --git a/.gitignore b/.gitignore
+index 0693647..7737ac4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -23,3 +23,4 @@ keeper
+ keys
+ local_settings.py
+ tools/conf/cinder.conf*
++tags
+diff --git a/bin/cinder-backup b/bin/cinder-backup
+new file mode 100755
+index 0000000..60de599
+--- /dev/null
++++ b/bin/cinder-backup
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python
++
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Starter script for Cinder Volume Backup."""
++
++import os
++import sys
++
++import eventlet
++
++eventlet.monkey_patch()
++
++# If ../cinder/__init__.py exists, add ../ to Python search path, so that
++# it will override what happens to be installed in /usr/(local/)lib/python...
++possible_topdir = os.path.normpath(os.path.join(os.path.abspath(sys.argv[0]),
++                                   os.pardir,
++                                   os.pardir))
++if os.path.exists(os.path.join(possible_topdir, 'cinder', '__init__.py')):
++    sys.path.insert(0, possible_topdir)
++
++
++from cinder import flags
++from cinder.openstack.common import log as logging
++from cinder import service
++from cinder import utils
++
++if __name__ == '__main__':
++    flags.parse_args(sys.argv)
++    logging.setup("cinder")
++    utils.monkey_patch()
++    server = service.Service.create(binary='cinder-backup')
++    service.serve(server)
++    service.wait()
+diff --git a/bin/cinder-manage b/bin/cinder-manage
+index 029cd3d..8436afc 100755
+--- a/bin/cinder-manage
++++ b/bin/cinder-manage
+@@ -642,7 +642,44 @@ class GetLogCommands(object):
+             print "No cinder entries in syslog!"
+ 
+ 
++class BackupCommands(object):
++    """Methods for managing backups."""
++
++    def list(self):
++        """List all backups (including ones in progress) and the host
++        on which the backup operation is running."""
++        ctxt = context.get_admin_context()
++        backups = db.backup_get_all(ctxt)
++
++        hdr = "%-6s\t%-32s\t%-32s\t%-24s\t%-24s\t%-12s\t%-12s\t%-12s\t%-12s"
++        print hdr % (_('ID'),
++                     _('User ID'),
++                     _('Project ID'),
++                     _('Host'),
++                     _('Name'),
++                     _('Container'),
++                     _('Status'),
++                     _('Size'),
++                     _('Object Count'))
++
++        res = "%-6d\t%-32s\t%-32s\t%-24s\t%-24s\t%-12s\t%-12s\t%-12d\t%-12d"
++        for backup in backups:
++            object_count = 0
++            if backup['object_count'] is not None:
++                object_count = backup['object_count']
++            print res % (backup['id'],
++                         backup['user_id'],
++                         backup['project_id'],
++                         backup['host'],
++                         backup['display_name'],
++                         backup['container'],
++                         backup['status'],
++                         backup['size'],
++                         object_count)
++
++
+ CATEGORIES = {
++    'backup': BackupCommands,
+     'config': ConfigCommands,
+     'db': DbCommands,
+     'host': HostCommands,
+diff --git a/cinder/api/contrib/backups.py b/cinder/api/contrib/backups.py
+new file mode 100644
+index 0000000..53b6b6c
+--- /dev/null
++++ b/cinder/api/contrib/backups.py
+@@ -0,0 +1,278 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""The backups api."""
++
++import webob
++from webob import exc
++from xml.dom import minidom
++
++from cinder.api import common
++from cinder.api import extensions
++from cinder.api.openstack import wsgi
++from cinder.api.views import backups as backup_views
++from cinder.api import xmlutil
++from cinder import backup as backupAPI
++from cinder import exception
++from cinder import flags
++from cinder.openstack.common import log as logging
++
++FLAGS = flags.FLAGS
++LOG = logging.getLogger(__name__)
++
++
++def make_backup(elem):
++    elem.set('id')
++    elem.set('status')
++    elem.set('size')
++    elem.set('container')
++    elem.set('volume_id')
++    elem.set('object_count')
++    elem.set('availability_zone')
++    elem.set('created_at')
++    elem.set('name')
++    elem.set('description')
++    elem.set('fail_reason')
++
++
++def make_backup_restore(elem):
++    elem.set('backup_id')
++    elem.set('volume_id')
++
++
++class BackupTemplate(xmlutil.TemplateBuilder):
++    def construct(self):
++        root = xmlutil.TemplateElement('backup', selector='backup')
++        make_backup(root)
++        alias = Backups.alias
++        namespace = Backups.namespace
++        return xmlutil.MasterTemplate(root, 1, nsmap={alias: namespace})
++
++
++class BackupsTemplate(xmlutil.TemplateBuilder):
++    def construct(self):
++        root = xmlutil.TemplateElement('backups')
++        elem = xmlutil.SubTemplateElement(root, 'backup', selector='backups')
++        make_backup(elem)
++        alias = Backups.alias
++        namespace = Backups.namespace
++        return xmlutil.MasterTemplate(root, 1, nsmap={alias: namespace})
++
++
++class BackupRestoreTemplate(xmlutil.TemplateBuilder):
++    def construct(self):
++        root = xmlutil.TemplateElement('restore', selector='restore')
++        make_backup_restore(root)
++        alias = Backups.alias
++        namespace = Backups.namespace
++        return xmlutil.MasterTemplate(root, 1, nsmap={alias: namespace})
++
++
++class CreateDeserializer(wsgi.MetadataXMLDeserializer):
++    def default(self, string):
++        dom = minidom.parseString(string)
++        backup = self._extract_backup(dom)
++        return {'body': {'backup': backup}}
++
++    def _extract_backup(self, node):
++        backup = {}
++        backup_node = self.find_first_child_named(node, 'backup')
++
++        attributes = ['container', 'display_name',
++                      'display_description', 'volume_id']
++
++        for attr in attributes:
++            if backup_node.getAttribute(attr):
++                backup[attr] = backup_node.getAttribute(attr)
++        return backup
++
++
++class RestoreDeserializer(wsgi.MetadataXMLDeserializer):
++    def default(self, string):
++        dom = minidom.parseString(string)
++        restore = self._extract_restore(dom)
++        return {'body': {'restore': restore}}
++
++    def _extract_restore(self, node):
++        restore = {}
++        restore_node = self.find_first_child_named(node, 'restore')
++        if restore_node.getAttribute('volume_id'):
++            restore['volume_id'] = restore_node.getAttribute('volume_id')
++        return restore
++
++
++class BackupsController(wsgi.Controller):
++    """The Backups API controller for the OpenStack API."""
++
++    _view_builder_class = backup_views.ViewBuilder
++
++    def __init__(self):
++        self.backup_api = backupAPI.API()
++        super(BackupsController, self).__init__()
++
++    @wsgi.serializers(xml=BackupTemplate)
++    def show(self, req, id):
++        """Return data about the given backup."""
++        LOG.debug(_('show called for member %s'), id)
++        context = req.environ['cinder.context']
++
++        try:
++            backup = self.backup_api.get(context, backup_id=id)
++        except exception.BackupNotFound as error:
++            raise exc.HTTPNotFound(explanation=unicode(error))
++
++        return self._view_builder.detail(req, backup)
++
++    def delete(self, req, id):
++        """Delete a backup."""
++        LOG.debug(_('delete called for member %s'), id)
++        context = req.environ['cinder.context']
++
++        LOG.audit(_('Delete backup with id: %s'), id, context=context)
++
++        try:
++            self.backup_api.delete(context, id)
++        except exception.BackupNotFound as error:
++            raise exc.HTTPNotFound(explanation=unicode(error))
++        except exception.InvalidBackup as error:
++            raise exc.HTTPBadRequest(explanation=unicode(error))
++
++        return webob.Response(status_int=202)
++
++    @wsgi.serializers(xml=BackupsTemplate)
++    def index(self, req):
++        """Returns a summary list of backups."""
++        return self._get_backups(req, is_detail=False)
++
++    @wsgi.serializers(xml=BackupsTemplate)
++    def detail(self, req):
++        """Returns a detailed list of backups."""
++        return self._get_backups(req, is_detail=True)
++
++    def _get_backups(self, req, is_detail):
++        """Returns a list of backups, transformed through view builder."""
++        context = req.environ['cinder.context']
++        backups = self.backup_api.get_all(context)
++        limited_list = common.limited(backups, req)
++
++        if is_detail:
++            backups = self._view_builder.detail_list(req, limited_list)
++        else:
++            backups = self._view_builder.summary_list(req, limited_list)
++        return backups
++
++    # TODO(frankm): Add some checks here including
++    # - whether requested volume_id exists so we can return some errors
++    #   immediately
++    # - maybe also do validation of swift container name
++    @wsgi.response(202)
++    @wsgi.serializers(xml=BackupTemplate)
++    @wsgi.deserializers(xml=CreateDeserializer)
++    def create(self, req, body):
++        """Create a new backup."""
++        LOG.debug(_('Creating new backup %s'), body)
++        if not self.is_valid_body(body, 'backup'):
++            raise exc.HTTPUnprocessableEntity()
++
++        context = req.environ['cinder.context']
++
++        try:
++            backup = body['backup']
++            volume_id = backup['volume_id']
++        except KeyError:
++            msg = _("Incorrect request body format")
++            raise exc.HTTPBadRequest(explanation=msg)
++        container = backup.get('container', None)
++        name = backup.get('name', None)
++        description = backup.get('description', None)
++
++        LOG.audit(_("Creating backup of volume %(volume_id)s in container"
++                    " %(container)s"), locals(), context=context)
++
++        try:
++            new_backup = self.backup_api.create(context, name, description,
++                                                volume_id, container)
++        except exception.InvalidVolume as error:
++            raise exc.HTTPBadRequest(explanation=unicode(error))
++        except exception.VolumeNotFound as error:
++            raise exc.HTTPNotFound(explanation=unicode(error))
++
++        retval = self._view_builder.summary(req, dict(new_backup.iteritems()))
++        return retval
++
++    @wsgi.response(202)
++    @wsgi.serializers(xml=BackupRestoreTemplate)
++    @wsgi.deserializers(xml=RestoreDeserializer)
++    def restore(self, req, id, body):
++        """Restore an existing backup to a volume."""
++        backup_id = id
++        LOG.debug(_('Restoring backup %(backup_id)s (%(body)s)') % locals())
++        if not self.is_valid_body(body, 'restore'):
++            raise exc.HTTPUnprocessableEntity()
++
++        context = req.environ['cinder.context']
++
++        try:
++            restore = body['restore']
++        except KeyError:
++            msg = _("Incorrect request body format")
++            raise exc.HTTPBadRequest(explanation=msg)
++        volume_id = restore.get('volume_id', None)
++
++        LOG.audit(_("Restoring backup %(backup_id)s to volume %(volume_id)s"),
++                  locals(), context=context)
++
++        try:
++            new_restore = self.backup_api.restore(context,
++                                                  backup_id=backup_id,
++                                                  volume_id=volume_id)
++        except exception.InvalidInput as error:
++            raise exc.HTTPBadRequest(explanation=unicode(error))
++        except exception.InvalidVolume as error:
++            raise exc.HTTPBadRequest(explanation=unicode(error))
++        except exception.InvalidBackup as error:
++            raise exc.HTTPBadRequest(explanation=unicode(error))
++        except exception.BackupNotFound as error:
++            raise exc.HTTPNotFound(explanation=unicode(error))
++        except exception.VolumeNotFound as error:
++            raise exc.HTTPNotFound(explanation=unicode(error))
++        except exception.VolumeSizeExceedsAvailableQuota as error:
++            raise exc.HTTPRequestEntityTooLarge(
++                explanation=error.message, headers={'Retry-After': 0})
++        except exception.VolumeLimitExceeded as error:
++            raise exc.HTTPRequestEntityTooLarge(
++                explanation=error.message, headers={'Retry-After': 0})
++
++        retval = self._view_builder.restore_summary(
++            req, dict(new_restore.iteritems()))
++        return retval
++
++
++class Backups(extensions.ExtensionDescriptor):
++    """Backups support."""
++
++    name = 'Backups'
++    alias = 'backups'
++    namespace = 'http://docs.openstack.org/volume/ext/backups/api/v1'
++    updated = '2012-12-12T00:00:00+00:00'
++
++    def get_resources(self):
++        resources = []
++        res = extensions.ResourceExtension(
++            Backups.alias, BackupsController(),
++            collection_actions={'detail': 'GET'},
++            member_actions={'restore': 'POST'})
++        resources.append(res)
++        return resources
+diff --git a/cinder/api/views/backups.py b/cinder/api/views/backups.py
+new file mode 100644
+index 0000000..446bf30
+--- /dev/null
++++ b/cinder/api/views/backups.py
+@@ -0,0 +1,90 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from cinder.api import common
++from cinder.openstack.common import log as logging
++
++
++LOG = logging.getLogger(__name__)
++
++
++class ViewBuilder(common.ViewBuilder):
++    """Model backup API responses as a python dictionary."""
++
++    _collection_name = "backups"
++
++    def __init__(self):
++        """Initialize view builder."""
++        super(ViewBuilder, self).__init__()
++
++    def summary_list(self, request, backups):
++        """Show a list of backups without many details."""
++        return self._list_view(self.summary, request, backups)
++
++    def detail_list(self, request, backups):
++        """Detailed view of a list of backups ."""
++        return self._list_view(self.detail, request, backups)
++
++    def summary(self, request, backup):
++        """Generic, non-detailed view of a backup."""
++        return {
++            'backup': {
++                'id': backup['id'],
++                'name': backup['display_name'],
++                'links': self._get_links(request,
++                                         backup['id']),
++            },
++        }
++
++    def restore_summary(self, request, restore):
++        """Generic, non-detailed view of a restore."""
++        return {
++            'restore': {
++                'backup_id': restore['backup_id'],
++                'volume_id': restore['volume_id'],
++            },
++        }
++
++    def detail(self, request, backup):
++        """Detailed view of a single backup."""
++        return {
++            'backup': {
++                'id': backup.get('id'),
++                'status': backup.get('status'),
++                'size': backup.get('size'),
++                'object_count': backup.get('object_count'),
++                'availability_zone': backup.get('availability_zone'),
++                'container': backup.get('container'),
++                'created_at': backup.get('created_at'),
++                'name': backup.get('display_name'),
++                'description': backup.get('display_description'),
++                'fail_reason': backup.get('fail_reason'),
++                'volume_id': backup.get('volume_id'),
++                'links': self._get_links(request, backup['id'])
++            }
++        }
++
++    def _list_view(self, func, request, backups):
++        """Provide a view for a list of backups."""
++        backups_list = [func(request, backup)['backup'] for backup in backups]
++        backups_links = self._get_collection_links(request,
++                                                   backups,
++                                                   self._collection_name)
++        backups_dict = dict(backups=backups_list)
++
++        if backups_links:
++            backups_dict['backups_links'] = backups_links
++
++        return backups_dict
+diff --git a/cinder/backup/__init__.py b/cinder/backup/__init__.py
+new file mode 100644
+index 0000000..368e2ff
+--- /dev/null
++++ b/cinder/backup/__init__.py
+@@ -0,0 +1,23 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++# Importing full names to not pollute the namespace and cause possible
++# collisions with use of 'from cinder.backup import <foo>' elsewhere.
++
++import cinder.flags
++import cinder.openstack.common.importutils
++
++API = cinder.openstack.common.importutils.import_class(
++        cinder.flags.FLAGS.backup_api_class)
+diff --git a/cinder/backup/api.py b/cinder/backup/api.py
+new file mode 100644
+index 0000000..1b5d1d4
+--- /dev/null
++++ b/cinder/backup/api.py
+@@ -0,0 +1,171 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++Handles all requests relating to the volume backups service.
++"""
++
++from eventlet import greenthread
++
++from cinder.backup import rpcapi as backup_rpcapi
++from cinder.db import base
++from cinder import exception
++from cinder import flags
++from cinder.openstack.common import log as logging
++import cinder.volume
++
++
++FLAGS = flags.FLAGS
++
++LOG = logging.getLogger(__name__)
++
++
++class API(base.Base):
++    """API for interacting with the volume backup manager."""
++
++    def __init__(self, db_driver=None):
++        self.backup_rpcapi = backup_rpcapi.BackupAPI()
++        self.volume_api = cinder.volume.API()
++        super(API, self).__init__(db_driver)
++
++    def get(self, context, backup_id):
++        rv = self.db.backup_get(context, backup_id)
++        return dict(rv.iteritems())
++
++    def delete(self, context, backup_id):
++        """
++        Make the RPC call to delete a volume backup.
++        """
++        backup = self.get(context, backup_id)
++        if backup['status'] not in ['available', 'error']:
++            msg = _('Backup status must be available or error')
++            raise exception.InvalidBackup(reason=msg)
++
++        self.db.backup_update(context, backup_id, {'status': 'deleting'})
++        self.backup_rpcapi.delete_backup(context,
++                                         backup['host'],
++                                         backup['id'])
++
++    # TODO(moorehef): Add support for search_opts, discarded atm
++    def get_all(self, context, search_opts={}):
++        if context.is_admin:
++            backups = self.db.backup_get_all(context)
++        else:
++            backups = self.db.backup_get_all_by_project(context,
++                                                        context.project_id)
++
++        return backups
++
++    def create(self, context, name, description, volume_id,
++               container, availability_zone=None):
++        """
++        Make the RPC call to create a volume backup.
++        """
++        volume = self.volume_api.get(context, volume_id)
++        if volume['status'] != "available":
++            msg = _('Volume to be backed up must be available')
++            raise exception.InvalidVolume(reason=msg)
++        self.db.volume_update(context, volume_id, {'status': 'backing-up'})
++
++        options = {'user_id': context.user_id,
++                   'project_id': context.project_id,
++                   'display_name': name,
++                   'display_description': description,
++                   'volume_id': volume_id,
++                   'status': 'creating',
++                   'container': container,
++                   'size': volume['size'],
++                   # TODO(DuncanT): This will need de-managling once
++                   #                multi-backend lands
++                   'host': volume['host'], }
++
++        backup = self.db.backup_create(context, options)
++
++        #TODO(DuncanT): In future, when we have a generic local attach,
++        #               this can go via the scheduler, which enables
++        #               better load ballancing and isolation of services
++        self.backup_rpcapi.create_backup(context,
++                                         backup['host'],
++                                         backup['id'],
++                                         volume_id)
++
++        return backup
++
++    def restore(self, context, backup_id, volume_id=None):
++        """
++        Make the RPC call to restore a volume backup.
++        """
++        backup = self.get(context, backup_id)
++        if backup['status'] != 'available':
++            msg = _('Backup status must be available')
++            raise exception.InvalidBackup(reason=msg)
++
++        size = backup['size']
++        if size is None:
++            msg = _('Backup to be restored has invalid size')
++            raise exception.InvalidBackup(reason=msg)
++
++        # Create a volume if none specified. If a volume is specified check
++        # it is large enough for the backup
++        if volume_id is None:
++            name = 'restore_backup_%s' % backup_id
++            description = 'auto-created_from_restore_from_swift'
++
++            LOG.audit(_("Creating volume of %(size)s GB for restore of "
++                        "backup %(backup_id)s"), locals(), context=context)
++            volume = self.volume_api.create(context, size, name, description)
++            volume_id = volume['id']
++
++            while True:
++                volume = self.volume_api.get(context, volume_id)
++                if volume['status'] != 'creating':
++                    break
++                greenthread.sleep(1)
++        else:
++            volume = self.volume_api.get(context, volume_id)
++            volume_size = volume['size']
++            if volume_size < size:
++                err = _('volume size %(volume_size)d is too small to restore '
++                        'backup of size %(size)d.') % locals()
++                raise exception.InvalidVolume(reason=err)
++
++        if volume['status'] != "available":
++            msg = _('Volume to be restored to must be available')
++            raise exception.InvalidVolume(reason=msg)
++
++        LOG.debug('Checking backup size %s against volume size %s',
++                  size, volume['size'])
++        if size > volume['size']:
++            msg = _('Volume to be restored to is smaller '
++                    'than the backup to be restored')
++            raise exception.InvalidVolume(reason=msg)
++
++        LOG.audit(_("Overwriting volume %(volume_id)s with restore of "
++                    "backup %(backup_id)s"), locals(), context=context)
++
++        # Setting the status here rather than setting at start and unrolling
++        # for each error condition, it should be a very small window
++        self.db.backup_update(context, backup_id, {'status': 'restoring'})
++        self.db.volume_update(context, volume_id, {'status':
++                                                   'restoring-backup'})
++        self.backup_rpcapi.restore_backup(context,
++                                          backup['host'],
++                                          backup['id'],
++                                          volume_id)
++
++        d = {'backup_id': backup_id,
++             'volume_id': volume_id, }
++
++        return d
+diff --git a/cinder/backup/manager.py b/cinder/backup/manager.py
+new file mode 100755
+index 0000000..3c00e84
+--- /dev/null
++++ b/cinder/backup/manager.py
+@@ -0,0 +1,260 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++Backup manager manages volume backups.
++
++Volume Backups are full copies of persistent volumes stored in Swift object
++storage. They are usable without the original object being available. A
++volume backup can be restored to the original volume it was created from or
++any other available volume with a minimum size of the original volume.
++Volume backups can be created, restored, deleted and listed.
++
++**Related Flags**
++
++:backup_topic:  What :mod:`rpc` topic to listen to (default:
++                        `cinder-backup`).
++:backup_manager:  The module name of a class derived from
++                          :class:`manager.Manager` (default:
++                          :class:`cinder.backup.manager.Manager`).
++
++"""
++
++from cinder import context
++from cinder import exception
++from cinder import flags
++from cinder import manager
++from cinder.openstack.common import cfg
++from cinder.openstack.common import excutils
++from cinder.openstack.common import importutils
++from cinder.openstack.common import log as logging
++
++LOG = logging.getLogger(__name__)
++
++backup_manager_opts = [
++    cfg.StrOpt('backup_service',
++               default='cinder.backup.services.swift',
++               help='Service to use for backups.'),
++]
++
++FLAGS = flags.FLAGS
++FLAGS.register_opts(backup_manager_opts)
++
++
++class BackupManager(manager.SchedulerDependentManager):
++    """Manages backup of block storage devices."""
++
++    RPC_API_VERSION = '1.0'
++
++    def __init__(self, *args, **kwargs):
++        self.service = importutils.import_module(FLAGS.backup_service)
++        self.az = FLAGS.storage_availability_zone
++        self.volume_manager = importutils.import_object(FLAGS.volume_manager)
++        self.driver = self.volume_manager.driver
++        super(BackupManager, self).__init__(service_name='backup',
++                                            *args, **kwargs)
++        self.driver.db = self.db
++
++    def init_host(self):
++        """Do any initialization that needs to be run if this is a
++           standalone service."""
++
++        ctxt = context.get_admin_context()
++        self.driver.do_setup(ctxt)
++        self.driver.check_for_setup_error()
++
++        LOG.info(_("Cleaning up incomplete backup operations"))
++        volumes = self.db.volume_get_all_by_host(ctxt, self.host)
++        for volume in volumes:
++            if volume['status'] == 'backing-up':
++                LOG.info(_('Resetting volume %s to available '
++                           '(was backing-up)') % volume['id'])
++                self.volume_manager.detach_volume(ctxt, volume['id'])
++            if volume['status'] == 'restoring-backup':
++                LOG.info(_('Resetting volume %s to error_restoring '
++                           '(was restoring-backup)') % volume['id'])
++                self.volume_manager.detach_volume(ctxt, volume['id'])
++                self.db.volume_update(ctxt, volume['id'],
++                                      {'status': 'error_restoring'})
++
++        # TODO(smulcahy) implement full resume of backup and restore
++        # operations on restart (rather than simply resetting)
++        backups = self.db.backup_get_all_by_host(ctxt, self.host)
++        for backup in backups:
++            if backup['status'] == 'creating':
++                LOG.info(_('Resetting backup %s to error '
++                           '(was creating)') % backup['id'])
++                err = 'incomplete backup reset on manager restart'
++                self.db.backup_update(ctxt, backup['id'], {'status': 'error',
++                                                           'fail_reason': err})
++            if backup['status'] == 'restoring':
++                LOG.info(_('Resetting backup %s to available '
++                           '(was restoring)') % backup['id'])
++                self.db.backup_update(ctxt, backup['id'],
++                                      {'status': 'available'})
++            if backup['status'] == 'deleting':
++                LOG.info(_('Resuming delete on backup: %s') % backup['id'])
++                self.delete_backup(ctxt, backup['id'])
++
++    def create_backup(self, context, backup_id):
++        """
++        Create volume backups using configured backup service.
++        """
++        backup = self.db.backup_get(context, backup_id)
++        volume_id = backup['volume_id']
++        volume = self.db.volume_get(context, volume_id)
++        LOG.debug(_('create_backup started, backup: %(backup_id)s for '
++                    'volume: %(volume_id)s') % locals())
++        self.db.backup_update(context, backup_id, {'host': self.host,
++                                                   'service':
++                                                   FLAGS.backup_service})
++
++        expected_status = 'backing-up'
++        actual_status = volume['status']
++        if actual_status != expected_status:
++            err = _('create_backup aborted, expected volume status '
++                    '%(expected_status)s but got %(actual_status)s') % locals()
++            self.db.backup_update(context, backup_id, {'status': 'error',
++                                                       'fail_reason': err})
++            raise exception.InvalidVolume(reason=err)
++
++        expected_status = 'creating'
++        actual_status = backup['status']
++        if actual_status != expected_status:
++            err = _('create_backup aborted, expected backup status '
++                    '%(expected_status)s but got %(actual_status)s') % locals()
++            self.db.volume_update(context, volume_id, {'status': 'available'})
++            self.db.backup_update(context, backup_id, {'status': 'error',
++                                                       'fail_reason': err})
++            raise exception.InvalidBackup(reason=err)
++
++        try:
++            backup_service = self.service.get_backup_service(context)
++            self.driver.backup_volume(context, backup, backup_service)
++        except Exception as err:
++            with excutils.save_and_reraise_exception():
++                self.db.volume_update(context, volume_id,
++                                      {'status': 'available'})
++                self.db.backup_update(context, backup_id,
++                                      {'status': 'error',
++                                       'fail_reason': unicode(err)})
++
++        self.db.volume_update(context, volume_id, {'status': 'available'})
++        self.db.backup_update(context, backup_id, {'status': 'available',
++                                                   'size': volume['size'],
++                                                   'availability_zone':
++                                                   self.az})
++        LOG.debug(_('create_backup finished. backup: %s'), backup_id)
++
++    def restore_backup(self, context, backup_id, volume_id):
++        """
++        Restore volume backups from configured backup service.
++        """
++        LOG.debug(_('restore_backup started, restoring backup: %(backup_id)s'
++                    ' to volume: %(volume_id)s') % locals())
++        backup = self.db.backup_get(context, backup_id)
++        volume = self.db.volume_get(context, volume_id)
++        self.db.backup_update(context, backup_id, {'host': self.host})
++
++        expected_status = 'restoring-backup'
++        actual_status = volume['status']
++        if actual_status != expected_status:
++            err = _('restore_backup aborted, expected volume status '
++                    '%(expected_status)s but got %(actual_status)s') % locals()
++            self.db.backup_update(context, backup_id, {'status': 'available'})
++            raise exception.InvalidVolume(reason=err)
++
++        expected_status = 'restoring'
++        actual_status = backup['status']
++        if actual_status != expected_status:
++            err = _('restore_backup aborted, expected backup status '
++                    '%(expected_status)s but got %(actual_status)s') % locals()
++            self.db.backup_update(context, backup_id, {'status': 'error',
++                                                       'fail_reason': err})
++            self.db.volume_update(context, volume_id, {'status': 'error'})
++            raise exception.InvalidBackup(reason=err)
++
++        if volume['size'] > backup['size']:
++            LOG.warn('volume: %s, size: %d is larger than backup: %d, '
++                     'size: %d, continuing with restore',
++                     volume['id'], volume['size'],
++                     backup['id'], backup['size'])
++
++        backup_service = backup['service']
++        configured_service = FLAGS.backup_service
++        if backup_service != configured_service:
++            err = _('restore_backup aborted, the backup service currently'
++                    ' configured [%(configured_service)s] is not the'
++                    ' backup service that was used to create this'
++                    ' backup [%(backup_service)s]') % locals()
++            self.db.backup_update(context, backup_id, {'status': 'available'})
++            self.db.volume_update(context, volume_id, {'status': 'error'})
++            raise exception.InvalidBackup(reason=err)
++
++        try:
++            backup_service = self.service.get_backup_service(context)
++            self.driver.restore_backup(context, backup, volume,
++                                       backup_service)
++        except Exception as err:
++            with excutils.save_and_reraise_exception():
++                self.db.volume_update(context, volume_id,
++                                      {'status': 'error_restoring'})
++                self.db.backup_update(context, backup_id,
++                                      {'status': 'available'})
++
++        self.db.volume_update(context, volume_id, {'status': 'available'})
++        self.db.backup_update(context, backup_id, {'status': 'available'})
++        LOG.debug(_('restore_backup finished, backup: %(backup_id)s restored'
++                    ' to volume: %(volume_id)s') % locals())
++
++    def delete_backup(self, context, backup_id):
++        """
++        Delete volume backup from configured backup service.
++        """
++        backup = self.db.backup_get(context, backup_id)
++        LOG.debug(_('delete_backup started, backup: %s'), backup_id)
++        self.db.backup_update(context, backup_id, {'host': self.host})
++
++        expected_status = 'deleting'
++        actual_status = backup['status']
++        if actual_status != expected_status:
++            err = _('delete_backup aborted, expected backup status '
++                    '%(expected_status)s but got %(actual_status)s') % locals()
++            self.db.backup_update(context, backup_id, {'status': 'error',
++                                                       'fail_reason': err})
++            raise exception.InvalidBackup(reason=err)
++
++        backup_service = backup['service']
++        configured_service = FLAGS.backup_service
++        if backup_service != configured_service:
++            err = _('delete_backup aborted, the backup service currently'
++                    ' configured [%(configured_service)s] is not the'
++                    ' backup service that was used to create this'
++                    ' backup [%(backup_service)s]') % locals()
++            self.db.backup_update(context, backup_id, {'status': 'available'})
++            raise exception.InvalidBackup(reason=err)
++
++        try:
++            backup_service = self.service.get_backup_service(context)
++            backup_service.delete(backup)
++        except Exception as err:
++            with excutils.save_and_reraise_exception():
++                self.db.backup_update(context, backup_id, {'status': 'error',
++                                                           'fail_reason':
++                                                           unicode(err)})
++
++        context = context.elevated()
++        self.db.backup_destroy(context, backup_id)
++        LOG.debug(_('delete_backup finished, backup %s deleted'), backup_id)
+diff --git a/cinder/backup/rpcapi.py b/cinder/backup/rpcapi.py
+new file mode 100644
+index 0000000..a0b8771
+--- /dev/null
++++ b/cinder/backup/rpcapi.py
+@@ -0,0 +1,73 @@
++# vim: tabstop=4 shiftwidth=4 softtabstop=4
++
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++Client side of the volume backup RPC API.
++"""
++
++from cinder import flags
++from cinder.openstack.common import log as logging
++from cinder.openstack.common import rpc
++import cinder.openstack.common.rpc.proxy
++
++
++LOG = logging.getLogger(__name__)
++
++FLAGS = flags.FLAGS
++
++
++class BackupAPI(cinder.openstack.common.rpc.proxy.RpcProxy):
++    '''Client side of the volume rpc API.
++
++    API version history:
++
++        1.0 - Initial version.
++    '''
++
++    BASE_RPC_API_VERSION = '1.0'
++
++    def __init__(self):
++        super(BackupAPI, self).__init__(
++            topic=FLAGS.backup_topic,
++            default_version=self.BASE_RPC_API_VERSION)
++
++    def create_backup(self, ctxt, host, backup_id, volume_id):
++        LOG.debug("create_backup in rpcapi backup_id %s", backup_id)
++        topic = rpc.queue_get_for(ctxt, self.topic, host)
++        LOG.debug("create queue topic=%s", topic)
++        self.cast(ctxt,
++                  self.make_msg('create_backup',
++                                backup_id=backup_id),
++                  topic=topic)
++
++    def restore_backup(self, ctxt, host, backup_id, volume_id):
++        LOG.debug("restore_backup in rpcapi backup_id %s", backup_id)
++        topic = rpc.queue_get_for(ctxt, self.topic, host)
++        LOG.debug("restore queue topic=%s", topic)
++        self.cast(ctxt,
++                  self.make_msg('restore_backup',
++                                backup_id=backup_id,
++                                volume_id=volume_id),
++                  topic=topic)
++
++    def delete_backup(self, ctxt, host, backup_id):
++        LOG.debug("delete_backup  rpcapi backup_id %s", backup_id)
++        topic = rpc.queue_get_for(ctxt, self.topic, host)
++        self.cast(ctxt,
++                  self.make_msg('delete_backup',
++                                backup_id=backup_id),
++                  topic=topic)
+diff --git a/cinder/backup/services/__init__.py b/cinder/backup/services/__init__.py
+new file mode 100644
+index 0000000..5350b06
+--- /dev/null
++++ b/cinder/backup/services/__init__.py
+@@ -0,0 +1,14 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
+diff --git a/cinder/backup/services/swift.py b/cinder/backup/services/swift.py
+new file mode 100644
+index 0000000..8e39b9e
+--- /dev/null
++++ b/cinder/backup/services/swift.py
+@@ -0,0 +1,352 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Implementation of a backup service that uses Swift as the backend
++
++**Related Flags**
++
++:backup_swift_url: The URL of the Swift endpoint (default:
++                                                        localhost:8080).
++:backup_swift_object_size: The size in bytes of the Swift objects used
++                                    for volume backups (default: 52428800).
++:backup_swift_retry_attempts: The number of retries to make for Swift
++                                    operations (default: 10).
++:backup_swift_retry_backoff: The backoff time in seconds between retrying
++                                    failed Swift operations (default: 10).
++:backup_compression_algorithm: Compression algorithm to use for volume
++                               backups. Supported options are:
++                               None (to disable), zlib and bz2 (default: zlib)
++"""
++
++import eventlet
++import hashlib
++import httplib
++import json
++import os
++import StringIO
++
++from cinder.db import base
++from cinder import exception
++from cinder import flags
++from cinder.openstack.common import cfg
++from cinder.openstack.common import log as logging
++from cinder.openstack.common import timeutils
++from swiftclient import client as swift
++
++LOG = logging.getLogger(__name__)
++
++swiftbackup_service_opts = [
++    cfg.StrOpt('backup_swift_url',
++               default='http://localhost:8080/v1/',
++               help='The URL of the Swift endpoint'),
++    cfg.StrOpt('backup_swift_container',
++               default='volumebackups',
++               help='The default Swift container to use'),
++    cfg.IntOpt('backup_swift_object_size',
++               default=52428800,
++               help='The size in bytes of Swift backup objects'),
++    cfg.IntOpt('backup_swift_retry_attempts',
++               default=10,
++               help='The number of retries to make for Swift operations'),
++    cfg.IntOpt('backup_swift_retry_backoff',
++               default=10,
++               help='The backoff time in seconds between Swift retries'),
++    cfg.StrOpt('backup_compression_algorithm',
++               default='zlib',
++               help='Compression algorithm (None to disable)'),
++]
++
++FLAGS = flags.FLAGS
++FLAGS.register_opts(swiftbackup_service_opts)
++
++
++class SwiftBackupService(base.Base):
++    """Provides backup, restore and delete of backup objects within Swift."""
++
++    SERVICE_VERSION = '1.0.0'
++
++    def _get_compressor(self, algorithm):
++        try:
++            if algorithm.lower() in ('none', 'off', 'no'):
++                return None
++            elif algorithm.lower() in ('zlib', 'gzip'):
++                import zlib as compressor
++                return compressor
++            elif algorithm.lower() in ('bz2', 'bzip2'):
++                import bz2 as compressor
++                return compressor
++        except ImportError:
++            pass
++
++        err = _('unsupported compression algorithm: %s') % algorithm
++        raise ValueError(unicode(err))
++
++    def __init__(self, context, db_driver=None):
++        self.context = context
++        self.swift_url = '%sAUTH_%s' % (FLAGS.backup_swift_url,
++                                        self.context.project_id)
++        self.az = FLAGS.storage_availability_zone
++        self.data_block_size_bytes = FLAGS.backup_swift_object_size
++        self.swift_attempts = FLAGS.backup_swift_retry_attempts
++        self.swift_backoff = FLAGS.backup_swift_retry_backoff
++        self.compressor = \
++            self._get_compressor(FLAGS.backup_compression_algorithm)
++        self.conn = swift.Connection(None, None, None,
++                                     retries=self.swift_attempts,
++                                     preauthurl=self.swift_url,
++                                     preauthtoken=self.context.auth_token,
++                                     starting_backoff=self.swift_backoff)
++        super(SwiftBackupService, self).__init__(db_driver)
++
++    def _check_container_exists(self, container):
++        LOG.debug(_('_check_container_exists: container: %s') % container)
++        try:
++            self.conn.head_container(container)
++        except swift.ClientException as error:
++            if error.http_status == httplib.NOT_FOUND:
++                LOG.debug(_('container %s does not exist') % container)
++                return False
++            else:
++                raise
++        else:
++            LOG.debug(_('container %s exists') % container)
++            return True
++
++    def _create_container(self, context, backup):
++        backup_id = backup['id']
++        container = backup['container']
++        LOG.debug(_('_create_container started, container: %(container)s,'
++                    'backup: %(backup_id)s') % locals())
++        if container is None:
++            container = FLAGS.backup_swift_container
++            self.db.backup_update(context, backup_id, {'container': container})
++        if not self._check_container_exists(container):
++            self.conn.put_container(container)
++        return container
++
++    def _generate_swift_object_name_prefix(self, backup):
++        az = 'az_%s' % self.az
++        backup_name = '%s_backup_%s' % (az, backup['id'])
++        volume = 'volume_%s' % (backup['volume_id'])
++        timestamp = timeutils.strtime(fmt="%Y%m%d%H%M%S")
++        prefix = volume + '/' + timestamp + '/' + backup_name
++        LOG.debug(_('_generate_swift_object_name_prefix: %s') % prefix)
++        return prefix
++
++    def _generate_object_names(self, backup):
++        prefix = backup['service_metadata']
++        swift_objects = self.conn.get_container(backup['container'],
++                                                prefix=prefix,
++                                                full_listing=True)[1]
++        swift_object_names = []
++        for swift_object in swift_objects:
++            swift_object_names.append(swift_object['name'])
++        LOG.debug(_('generated object list: %s') % swift_object_names)
++        return swift_object_names
++
++    def _metadata_filename(self, backup):
++        swift_object_name = backup['service_metadata']
++        filename = '%s_metadata' % swift_object_name
++        return filename
++
++    def _write_metadata(self, backup, volume_id, container, object_list):
++        filename = self._metadata_filename(backup)
++        LOG.debug(_('_write_metadata started, container name: %(container)s,'
++                    ' metadata filename: %(filename)s') % locals())
++        metadata = {}
++        metadata['version'] = self.SERVICE_VERSION
++        metadata['backup_id'] = backup['id']
++        metadata['volume_id'] = volume_id
++        metadata['backup_name'] = backup['display_name']
++        metadata['backup_description'] = backup['display_description']
++        metadata['created_at'] = str(backup['created_at'])
++        metadata['objects'] = object_list
++        metadata_json = json.dumps(metadata, sort_keys=True, indent=2)
++        reader = StringIO.StringIO(metadata_json)
++        etag = self.conn.put_object(container, filename, reader)
++        md5 = hashlib.md5(metadata_json).hexdigest()
++        if etag != md5:
++            err = _('error writing metadata file to swift, MD5 of metadata'
++                    ' file in swift [%(etag)s] is not the same as MD5 of '
++                    'metadata file sent to swift [%(md5)s]') % locals()
++            raise exception.InvalidBackup(reason=err)
++        LOG.debug(_('_write_metadata finished'))
++
++    def _read_metadata(self, backup):
++        container = backup['container']
++        filename = self._metadata_filename(backup)
++        LOG.debug(_('_read_metadata started, container name: %(container)s, '
++                    'metadata filename: %(filename)s') % locals())
++        (resp, body) = self.conn.get_object(container, filename)
++        metadata = json.loads(body)
++        LOG.debug(_('_read_metadata finished (%s)') % metadata)
++        return metadata['objects']
++
++    def backup(self, backup, volume_file):
++        """Backup the given volume to swift using the given backup metadata.
++        """
++        backup_id = backup['id']
++        volume_id = backup['volume_id']
++        volume = self.db.volume_get(self.context, volume_id)
++
++        if volume['size'] <= 0:
++            err = _('volume size %d is invalid.') % volume['size']
++            raise exception.InvalidVolume(reason=err)
++
++        container = self._create_container(self.context, backup)
++
++        object_prefix = self._generate_swift_object_name_prefix(backup)
++        backup['service_metadata'] = object_prefix
++        self.db.backup_update(self.context, backup_id, {'service_metadata':
++                                                        object_prefix})
++        volume_size_bytes = volume['size'] * 1024 * 1024 * 1024
++        availability_zone = self.az
++        LOG.debug(_('starting backup of volume: %(volume_id)s to swift,'
++                    ' volume size: %(volume_size_bytes)d, swift object names'
++                    ' prefix %(object_prefix)s, availability zone:'
++                    ' %(availability_zone)s') % locals())
++        object_id = 1
++        object_list = []
++        while True:
++            data_block_size_bytes = self.data_block_size_bytes
++            object_name = '%s-%05d' % (object_prefix, object_id)
++            obj = {}
++            obj[object_name] = {}
++            obj[object_name]['offset'] = volume_file.tell()
++            data = volume_file.read(data_block_size_bytes)
++            obj[object_name]['length'] = len(data)
++            if data == '':
++                break
++            LOG.debug(_('reading chunk of data from volume'))
++            if self.compressor is not None:
++                algorithm = FLAGS.backup_compression_algorithm.lower()
++                obj[object_name]['compression'] = algorithm
++                data_size_bytes = len(data)
++                data = self.compressor.compress(data)
++                comp_size_bytes = len(data)
++                LOG.debug(_('compressed %(data_size_bytes)d bytes of data'
++                            ' to %(comp_size_bytes)d bytes using '
++                            '%(algorithm)s') % locals())
++            else:
++                LOG.debug(_('not compressing data'))
++                obj[object_name]['compression'] = 'none'
++
++            reader = StringIO.StringIO(data)
++            LOG.debug(_('About to put_object'))
++            etag = self.conn.put_object(container, object_name, reader)
++            LOG.debug(_('swift MD5 for %(object_name)s: %(etag)s') % locals())
++            md5 = hashlib.md5(data).hexdigest()
++            obj[object_name]['md5'] = md5
++            LOG.debug(_('backup MD5 for %(object_name)s: %(md5)s') % locals())
++            if etag != md5:
++                err = _('error writing object to swift, MD5 of object in '
++                        'swift %(etag)s is not the same as MD5 of object sent '
++                        'to swift %(md5)s') % locals()
++                raise exception.InvalidBackup(reason=err)
++            object_list.append(obj)
++            object_id += 1
++            LOG.debug(_('Calling eventlet.sleep(0)'))
++            eventlet.sleep(0)
++        self._write_metadata(backup, volume_id, container, object_list)
++        self.db.backup_update(self.context, backup_id, {'object_count':
++                                                        object_id})
++        LOG.debug(_('backup %s finished.') % backup_id)
++
++    def restore(self, backup, volume_id, volume_file):
++        """Restore the given volume backup from swift.
++        """
++        backup_id = backup['id']
++        container = backup['container']
++        volume = self.db.volume_get(self.context, volume_id)
++        volume_size = volume['size']
++        backup_size = backup['size']
++
++        object_prefix = backup['service_metadata']
++        LOG.debug(_('starting restore of backup %(object_prefix)s from swift'
++                    ' container: %(container)s, to volume %(volume_id)s, '
++                    'backup: %(backup_id)s') % locals())
++        swift_object_names = self._generate_object_names(backup)
++        metadata_objects = self._read_metadata(backup)
++        metadata_object_names = []
++        for metadata_object in metadata_objects:
++            metadata_object_names.extend(metadata_object.keys())
++        LOG.debug(_('metadata_object_names = %s') % metadata_object_names)
++        prune_list = [self._metadata_filename(backup)]
++        swift_object_names = [swift_object_name for swift_object_name in
++                              swift_object_names if swift_object_name
++                              not in prune_list]
++        if sorted(swift_object_names) != sorted(metadata_object_names):
++            err = _('restore_backup aborted, actual swift object list in '
++                    'swift does not match object list stored in metadata')
++            raise exception.InvalidBackup(reason=err)
++
++        for metadata_object in metadata_objects:
++            object_name = metadata_object.keys()[0]
++            LOG.debug(_('restoring object from swift. backup: %(backup_id)s, '
++                        'container: %(container)s, swift object name: '
++                        '%(object_name)s, volume: %(volume_id)s') % locals())
++            (resp, body) = self.conn.get_object(container, object_name)
++            compression_algorithm = metadata_object[object_name]['compression']
++            decompressor = self._get_compressor(compression_algorithm)
++            if decompressor is not None:
++                LOG.debug(_('decompressing data using %s algorithm') %
++                          compression_algorithm)
++                decompressed = decompressor.decompress(body)
++                volume_file.write(decompressed)
++            else:
++                volume_file.write(body)
++
++            # force flush every write to avoid long blocking write on close
++            volume_file.flush()
++            os.fsync(volume_file.fileno())
++            # Restoring a backup to a volume can take some time. Yield so other
++            # threads can run, allowing for among other things the service
++            # status to be updated
++            eventlet.sleep(0)
++        LOG.debug(_('restore %(backup_id)s to %(volume_id)s finished.') %
++                  locals())
++
++    def delete(self, backup):
++        """Delete the given backup from swift."""
++        container = backup['container']
++        LOG.debug('delete started, backup: %s, container: %s, prefix: %s',
++                  backup['id'], container, backup['service_metadata'])
++
++        if container is not None:
++            swift_object_names = []
++            try:
++                swift_object_names = self._generate_object_names(backup)
++            except Exception:
++                LOG.warn(_('swift error while listing objects, continuing'
++                           ' with delete'))
++
++            for swift_object_name in swift_object_names:
++                try:
++                    self.conn.delete_object(container, swift_object_name)
++                except Exception:
++                    LOG.warn(_('swift error while deleting object %s, '
++                               'continuing with delete') % swift_object_name)
++                else:
++                    LOG.debug(_('deleted swift object: %(swift_object_name)s'
++                                ' in container: %(container)s') % locals())
++                # Deleting a backup's objects from swift can take some time.
++                # Yield so other threads can run
++                eventlet.sleep(0)
++
++        LOG.debug(_('delete %s finished') % backup['id'])
++
++
++def get_backup_service(context):
++    return SwiftBackupService(context)
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index 373be12..0c79511 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -61,7 +61,10 @@ db_opts = [
+                help='Template string to be used to generate volume names'),
+     cfg.StrOpt('snapshot_name_template',
+                default='snapshot-%s',
+-               help='Template string to be used to generate snapshot names'), ]
++               help='Template string to be used to generate snapshot names'),
++    cfg.StrOpt('backup_name_template',
++               default='backup-%s',
++               help='Template string to be used to generate backup names'), ]
+ 
+ FLAGS = flags.FLAGS
+ FLAGS.register_opts(db_opts)
+@@ -676,3 +679,45 @@ def quota_destroy_all_by_project(context, project_id):
+ def reservation_expire(context):
+     """Roll back any expired reservations."""
+     return IMPL.reservation_expire(context)
++
++
++###################
++
++
++def backup_get(context, backup_id):
++    """Get a backup or raise if it does not exist."""
++    return IMPL.backup_get(context, backup_id)
++
++
++def backup_get_all(context):
++    """Get all backups."""
++    return IMPL.backup_get_all(context)
++
++
++def backup_get_all_by_host(context, host):
++    """Get all backups belonging to a host."""
++    return IMPL.backup_get_all_by_host(context, host)
++
++
++def backup_create(context, values):
++    """Create a backup from the values dictionary."""
++    return IMPL.backup_create(context, values)
++
++
++def backup_get_all_by_project(context, project_id):
++    """Get all backups belonging to a project."""
++    return IMPL.backup_get_all_by_project(context, project_id)
++
++
++def backup_update(context, backup_id, values):
++    """
++    Set the given properties on a backup and update it.
++
++    Raises NotFound if backup does not exist.
++    """
++    return IMPL.backup_update(context, backup_id, values)
++
++
++def backup_destroy(context, backup_id):
++    """Destroy the backup or raise if it does not exist."""
++    return IMPL.backup_destroy(context, backup_id)
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index 1818b96..14f4b3c 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -1827,3 +1827,68 @@ def sm_volume_get(context, volume_id):
+ 
+ def sm_volume_get_all(context):
+     return model_query(context, models.SMVolume, read_deleted="yes").all()
++
++
++###############################
++
++
++@require_context
++def backup_get(context, backup_id, session=None):
++    result = model_query(context, models.Backup,
++                         read_deleted="yes").filter_by(id=backup_id).first()
++    if not result:
++        raise exception.BackupNotFound(backup_id=backup_id)
++    return result
++
++
++@require_admin_context
++def backup_get_all(context):
++    return model_query(context, models.Backup, read_deleted="yes").all()
++
++
++@require_admin_context
++def backup_get_all_by_host(context, host):
++    return model_query(context, models.Backup,
++                       read_deleted="yes").filter_by(host=host).all()
++
++
++@require_context
++def backup_get_all_by_project(context, project_id):
++    authorize_project_context(context, project_id)
++
++    return model_query(context, models.Backup, read_deleted="yes").all()
++
++
++@require_context
++def backup_create(context, values):
++    backup = models.Backup()
++    if not values.get('id'):
++        values['id'] = str(uuid.uuid4())
++    backup.update(values)
++    backup.save()
++    return backup
++
++
++@require_context
++def backup_update(context, backup_id, values):
++    session = get_session()
++    with session.begin():
++        backup = model_query(context, models.Backup,
++                             session=session, read_deleted="yes").\
++            filter_by(id=backup_id).first()
++
++        if not backup:
++            raise exception.BackupNotFound(
++                _("No backup with id %(backup_id)s") % locals())
++
++        backup.update(values)
++        backup.save(session=session)
++    return backup
++
++
++@require_admin_context
++def backup_destroy(context, backup_id):
++    session = get_session()
++    with session.begin():
++        model_query(context, models.Backup,
++                    read_deleted="yes").filter_by(id=backup_id).delete()
+diff --git a/cinder/db/sqlalchemy/migrate_repo/versions/008_add_backup.py b/cinder/db/sqlalchemy/migrate_repo/versions/008_add_backup.py
+new file mode 100644
+index 0000000..4cc1689
+--- /dev/null
++++ b/cinder/db/sqlalchemy/migrate_repo/versions/008_add_backup.py
+@@ -0,0 +1,106 @@
++# vim: tabstop=4 shiftwidth=4 softtabstop=4
++
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from sqlalchemy import Boolean, Column, DateTime
++from sqlalchemy import MetaData, Integer, String, Table
++
++from cinder.openstack.common import log as logging
++
++LOG = logging.getLogger(__name__)
++
++
++def upgrade(migrate_engine):
++    meta = MetaData()
++    meta.bind = migrate_engine
++
++    # New table
++    backups = Table(
++        'backups', meta,
++        Column('created_at', DateTime(timezone=False)),
++        Column('updated_at', DateTime(timezone=False)),
++        Column('deleted_at', DateTime(timezone=False)),
++        Column('deleted', Boolean(create_constraint=True, name=None)),
++        Column('id', String(36), primary_key=True, nullable=False),
++        Column('volume_id', String(36), nullable=False),
++        Column('user_id', String(length=255, convert_unicode=False,
++                                 assert_unicode=None,
++                                 unicode_error=None,
++                                 _warn_on_bytestring=False)),
++        Column('project_id', String(length=255, convert_unicode=False,
++                                    assert_unicode=None,
++                                    unicode_error=None,
++                                    _warn_on_bytestring=False)),
++        Column('host', String(length=255, convert_unicode=False,
++                              assert_unicode=None,
++                              unicode_error=None,
++                              _warn_on_bytestring=False)),
++        Column('availability_zone', String(length=255,
++                                           convert_unicode=False,
++                                           assert_unicode=None,
++                                           unicode_error=None,
++                                           _warn_on_bytestring=False)),
++        Column('display_name', String(length=255, convert_unicode=False,
++                                      assert_unicode=None,
++                                      unicode_error=None,
++                                      _warn_on_bytestring=False)),
++        Column('display_description', String(length=255,
++                                             convert_unicode=False,
++                                             assert_unicode=None,
++                                             unicode_error=None,
++                                             _warn_on_bytestring=False)),
++        Column('container', String(length=255, convert_unicode=False,
++                                   assert_unicode=None,
++                                   unicode_error=None,
++                                   _warn_on_bytestring=False)),
++        Column('status', String(length=255, convert_unicode=False,
++                                assert_unicode=None,
++                                unicode_error=None,
++                                _warn_on_bytestring=False)),
++        Column('fail_reason', String(length=255, convert_unicode=False,
++                                     assert_unicode=None,
++                                     unicode_error=None,
++                                     _warn_on_bytestring=False)),
++        Column('service_metadata', String(length=255, convert_unicode=False,
++                                          assert_unicode=None,
++                                          unicode_error=None,
++                                          _warn_on_bytestring=False)),
++        Column('service', String(length=255, convert_unicode=False,
++                                 assert_unicode=None,
++                                 unicode_error=None,
++                                 _warn_on_bytestring=False)),
++        Column('size', Integer()),
++        Column('object_count', Integer()),
++        mysql_engine='InnoDB'
++    )
++
++    try:
++        backups.create()
++    except Exception:
++        LOG.error(_("Table |%s| not created!"), repr(backups))
++        raise
++
++
++def downgrade(migrate_engine):
++    meta = MetaData()
++    meta.bind = migrate_engine
++
++    backups = Table('backups', meta, autoload=True)
++    try:
++        backups.drop()
++    except Exception:
++        LOG.error(_("backups table not dropped"))
++        raise
+diff --git a/cinder/db/sqlalchemy/models.py b/cinder/db/sqlalchemy/models.py
+index b37cbd8..7d4fce4 100644
+--- a/cinder/db/sqlalchemy/models.py
++++ b/cinder/db/sqlalchemy/models.py
+@@ -385,6 +385,32 @@ class SMVolume(BASE, CinderBase):
+     vdi_uuid = Column(String(255))
+ 
+ 
++class Backup(BASE, CinderBase):
++    """Represents a backup of a volume to Swift."""
++    __tablename__ = 'backups'
++    id = Column(String(36), primary_key=True)
++
++    @property
++    def name(self):
++        return FLAGS.backup_name_template % self.id
++
++    user_id = Column(String(255), nullable=False)
++    project_id = Column(String(255), nullable=False)
++
++    volume_id = Column(String(36), nullable=False)
++    host = Column(String(255))
++    availability_zone = Column(String(255))
++    display_name = Column(String(255))
++    display_description = Column(String(255))
++    container = Column(String(255))
++    status = Column(String(255))
++    fail_reason = Column(String(255))
++    service_metadata = Column(String(255))
++    service = Column(String(255))
++    size = Column(Integer)
++    object_count = Column(Integer)
++
++
+ def register_models():
+     """Register Models and create metadata.
+ 
+@@ -393,7 +419,8 @@ def register_models():
+     connection is lost and needs to be reestablished.
+     """
+     from sqlalchemy import create_engine
+-    models = (Migration,
++    models = (Backup,
++              Migration,
+               Service,
+               SMBackendConf,
+               SMFlavors,
+diff --git a/cinder/exception.py b/cinder/exception.py
+index 86d6d12..c89e1ba 100644
+--- a/cinder/exception.py
++++ b/cinder/exception.py
+@@ -537,3 +537,11 @@ class GlanceMetadataExists(Invalid):
+ 
+ class ImageCopyFailure(Invalid):
+     message = _("Failed to copy image to volume")
++
++
++class BackupNotFound(NotFound):
++    message = _("Backup %(backup_id)s could not be found.")
++
++
++class InvalidBackup(Invalid):
++    message = _("Invalid backup: %(reason)s")
+diff --git a/cinder/flags.py b/cinder/flags.py
+index 71be575..672e334 100644
+--- a/cinder/flags.py
++++ b/cinder/flags.py
+@@ -130,6 +130,9 @@ global_opts = [
+     cfg.StrOpt('volume_topic',
+                default='cinder-volume',
+                help='the topic volume nodes listen on'),
++    cfg.StrOpt('backup_topic',
++               default='cinder-backup',
++               help='the topic volume backup nodes listen on'),
+     cfg.BoolOpt('enable_v1_api',
+                 default=True,
+                 help=_("Deploy v1 of the Cinder API. ")),
+@@ -175,6 +178,9 @@ global_opts = [
+     cfg.StrOpt('volume_manager',
+                default='cinder.volume.manager.VolumeManager',
+                help='full class name for the Manager for volume'),
++    cfg.StrOpt('backup_manager',
++               default='cinder.backup.manager.BackupManager',
++               help='full class name for the Manager for volume backup'),
+     cfg.StrOpt('scheduler_manager',
+                default='cinder.scheduler.manager.SchedulerManager',
+                help='full class name for the Manager for scheduler'),
+@@ -215,6 +221,9 @@ global_opts = [
+     cfg.StrOpt('volume_api_class',
+                default='cinder.volume.api.API',
+                help='The full class name of the volume API class to use'),
++    cfg.StrOpt('backup_api_class',
++               default='cinder.backup.api.API',
++               help='The full class name of the volume backup API class'),
+     cfg.StrOpt('auth_strategy',
+                default='noauth',
+                help='The strategy to use for auth. Supports noauth, keystone, '
+diff --git a/cinder/tests/api/contrib/test_backups.py b/cinder/tests/api/contrib/test_backups.py
+new file mode 100644
+index 0000000..bc192cb
+--- /dev/null
++++ b/cinder/tests/api/contrib/test_backups.py
+@@ -0,0 +1,856 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++Tests for Backup code.
++"""
++
++import json
++from xml.dom import minidom
++
++import webob
++
++# needed for stubs to work
++import cinder.backup
++from cinder import context
++from cinder import db
++from cinder import exception
++from cinder.openstack.common import log as logging
++from cinder import test
++from cinder.tests.api import fakes
++# needed for stubs to work
++import cinder.volume
++
++
++LOG = logging.getLogger(__name__)
++
++
++class BackupsAPITestCase(test.TestCase):
++    """Test Case for backups API."""
++
++    def setUp(self):
++        super(BackupsAPITestCase, self).setUp()
++
++    def tearDown(self):
++        super(BackupsAPITestCase, self).tearDown()
++
++    @staticmethod
++    def _create_backup(volume_id=1,
++                       display_name='test_backup',
++                       display_description='this is a test backup',
++                       container='volumebackups',
++                       status='creating',
++                       size=0, object_count=0):
++        """Create a backup object."""
++        backup = {}
++        backup['volume_id'] = volume_id
++        backup['user_id'] = 'fake'
++        backup['project_id'] = 'fake'
++        backup['host'] = 'testhost'
++        backup['availability_zone'] = 'az1'
++        backup['display_name'] = display_name
++        backup['display_description'] = display_description
++        backup['container'] = container
++        backup['status'] = status
++        backup['fail_reason'] = ''
++        backup['size'] = size
++        backup['object_count'] = object_count
++        return db.backup_create(context.get_admin_context(), backup)['id']
++
++    @staticmethod
++    def _get_backup_attrib(backup_id, attrib_name):
++        return db.backup_get(context.get_admin_context(),
++                             backup_id)[attrib_name]
++
++    @staticmethod
++    def _create_volume(display_name='test_volume',
++                       display_description='this is a test volume',
++                       status='creating',
++                       size=1):
++        """Create a volume object."""
++        vol = {}
++        vol['size'] = size
++        vol['user_id'] = 'fake'
++        vol['project_id'] = 'fake'
++        vol['status'] = status
++        vol['display_name'] = display_name
++        vol['display_description'] = display_description
++        vol['attach_status'] = 'detached'
++        return db.volume_create(context.get_admin_context(), vol)['id']
++
++    def test_show_backup(self):
++        volume_id = self._create_volume(size=5)
++        backup_id = self._create_backup(volume_id)
++        LOG.debug('Created backup with id %s' % backup_id)
++        req = webob.Request.blank('/v2/fake/backups/%s' %
++                                  backup_id)
++        req.method = 'GET'
++        req.headers['Content-Type'] = 'application/json'
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 200)
++        self.assertEqual(res_dict['backup']['availability_zone'], 'az1')
++        self.assertEqual(res_dict['backup']['container'], 'volumebackups')
++        self.assertEqual(res_dict['backup']['description'],
++                         'this is a test backup')
++        self.assertEqual(res_dict['backup']['name'], 'test_backup')
++        self.assertEqual(res_dict['backup']['id'], backup_id)
++        self.assertEqual(res_dict['backup']['object_count'], 0)
++        self.assertEqual(res_dict['backup']['size'], 0)
++        self.assertEqual(res_dict['backup']['status'], 'creating')
++        self.assertEqual(res_dict['backup']['volume_id'], volume_id)
++
++        db.backup_destroy(context.get_admin_context(), backup_id)
++        db.volume_destroy(context.get_admin_context(), volume_id)
++
++    def test_show_backup_xml_content_type(self):
++        volume_id = self._create_volume(size=5)
++        backup_id = self._create_backup(volume_id)
++        req = webob.Request.blank('/v2/fake/backups/%s' % backup_id)
++        req.method = 'GET'
++        req.headers['Content-Type'] = 'application/xml'
++        req.headers['Accept'] = 'application/xml'
++        res = req.get_response(fakes.wsgi_app())
++        self.assertEqual(res.status_int, 200)
++        dom = minidom.parseString(res.body)
++        backup = dom.getElementsByTagName('backup')
++        name = backup.item(0).getAttribute('name')
++        container_name = backup.item(0).getAttribute('container')
++        self.assertEquals(container_name.strip(), "volumebackups")
++        self.assertEquals(name.strip(), "test_backup")
++        db.backup_destroy(context.get_admin_context(), backup_id)
++        db.volume_destroy(context.get_admin_context(), volume_id)
++
++    def test_show_backup_with_backup_NotFound(self):
++        req = webob.Request.blank('/v2/fake/backups/9999')
++        req.method = 'GET'
++        req.headers['Content-Type'] = 'application/json'
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 404)
++        self.assertEqual(res_dict['itemNotFound']['code'], 404)
++        self.assertEqual(res_dict['itemNotFound']['message'],
++                         'Backup 9999 could not be found.')
++
++    def test_list_backups_json(self):
++        backup_id1 = self._create_backup()
++        backup_id2 = self._create_backup()
++        backup_id3 = self._create_backup()
++
++        req = webob.Request.blank('/v2/fake/backups')
++        req.method = 'GET'
++        req.headers['Content-Type'] = 'application/json'
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 200)
++        self.assertEqual(len(res_dict['backups'][0]), 3)
++        self.assertEqual(res_dict['backups'][0]['id'], backup_id1)
++        self.assertEqual(res_dict['backups'][0]['name'], 'test_backup')
++        self.assertEqual(len(res_dict['backups'][1]), 3)
++        self.assertEqual(res_dict['backups'][1]['id'], backup_id2)
++        self.assertEqual(res_dict['backups'][1]['name'], 'test_backup')
++        self.assertEqual(len(res_dict['backups'][2]), 3)
++        self.assertEqual(res_dict['backups'][2]['id'], backup_id3)
++        self.assertEqual(res_dict['backups'][2]['name'], 'test_backup')
++
++        db.backup_destroy(context.get_admin_context(), backup_id3)
++        db.backup_destroy(context.get_admin_context(), backup_id2)
++        db.backup_destroy(context.get_admin_context(), backup_id1)
++
++    def test_list_backups_xml(self):
++        backup_id1 = self._create_backup()
++        backup_id2 = self._create_backup()
++        backup_id3 = self._create_backup()
++
++        req = webob.Request.blank('/v2/fake/backups')
++        req.method = 'GET'
++        req.headers['Content-Type'] = 'application/xml'
++        req.headers['Accept'] = 'application/xml'
++        res = req.get_response(fakes.wsgi_app())
++
++        self.assertEqual(res.status_int, 200)
++        dom = minidom.parseString(res.body)
++        backup_list = dom.getElementsByTagName('backup')
++
++        self.assertEqual(backup_list.item(0).attributes.length, 2)
++        self.assertEqual(backup_list.item(0).getAttribute('id'),
++                         backup_id1)
++        self.assertEqual(backup_list.item(1).attributes.length, 2)
++        self.assertEqual(backup_list.item(1).getAttribute('id'),
++                         backup_id2)
++        self.assertEqual(backup_list.item(2).attributes.length, 2)
++        self.assertEqual(backup_list.item(2).getAttribute('id'),
++                         backup_id3)
++
++        db.backup_destroy(context.get_admin_context(), backup_id3)
++        db.backup_destroy(context.get_admin_context(), backup_id2)
++        db.backup_destroy(context.get_admin_context(), backup_id1)
++
++    def test_list_backups_detail_json(self):
++        backup_id1 = self._create_backup()
++        backup_id2 = self._create_backup()
++        backup_id3 = self._create_backup()
++
++        req = webob.Request.blank('/v2/fake/backups/detail')
++        req.method = 'GET'
++        req.headers['Content-Type'] = 'application/json'
++        req.headers['Accept'] = 'application/json'
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 200)
++        self.assertEqual(len(res_dict['backups'][0]), 12)
++        self.assertEqual(res_dict['backups'][0]['availability_zone'], 'az1')
++        self.assertEqual(res_dict['backups'][0]['container'],
++                         'volumebackups')
++        self.assertEqual(res_dict['backups'][0]['description'],
++                         'this is a test backup')
++        self.assertEqual(res_dict['backups'][0]['name'],
++                         'test_backup')
++        self.assertEqual(res_dict['backups'][0]['id'], backup_id1)
++        self.assertEqual(res_dict['backups'][0]['object_count'], 0)
++        self.assertEqual(res_dict['backups'][0]['size'], 0)
++        self.assertEqual(res_dict['backups'][0]['status'], 'creating')
++        self.assertEqual(res_dict['backups'][0]['volume_id'], '1')
++
++        self.assertEqual(len(res_dict['backups'][1]), 12)
++        self.assertEqual(res_dict['backups'][1]['availability_zone'], 'az1')
++        self.assertEqual(res_dict['backups'][1]['container'],
++                         'volumebackups')
++        self.assertEqual(res_dict['backups'][1]['description'],
++                         'this is a test backup')
++        self.assertEqual(res_dict['backups'][1]['name'],
++                         'test_backup')
++        self.assertEqual(res_dict['backups'][1]['id'], backup_id2)
++        self.assertEqual(res_dict['backups'][1]['object_count'], 0)
++        self.assertEqual(res_dict['backups'][1]['size'], 0)
++        self.assertEqual(res_dict['backups'][1]['status'], 'creating')
++        self.assertEqual(res_dict['backups'][1]['volume_id'], '1')
++
++        self.assertEqual(len(res_dict['backups'][2]), 12)
++        self.assertEqual(res_dict['backups'][2]['availability_zone'], 'az1')
++        self.assertEqual(res_dict['backups'][2]['container'],
++                         'volumebackups')
++        self.assertEqual(res_dict['backups'][2]['description'],
++                         'this is a test backup')
++        self.assertEqual(res_dict['backups'][2]['name'],
++                         'test_backup')
++        self.assertEqual(res_dict['backups'][2]['id'], backup_id3)
++        self.assertEqual(res_dict['backups'][2]['object_count'], 0)
++        self.assertEqual(res_dict['backups'][2]['size'], 0)
++        self.assertEqual(res_dict['backups'][2]['status'], 'creating')
++        self.assertEqual(res_dict['backups'][2]['volume_id'], '1')
++
++        db.backup_destroy(context.get_admin_context(), backup_id3)
++        db.backup_destroy(context.get_admin_context(), backup_id2)
++        db.backup_destroy(context.get_admin_context(), backup_id1)
++
++    def test_list_backups_detail_xml(self):
++        backup_id1 = self._create_backup()
++        backup_id2 = self._create_backup()
++        backup_id3 = self._create_backup()
++
++        req = webob.Request.blank('/v2/fake/backups/detail')
++        req.method = 'GET'
++        req.headers['Content-Type'] = 'application/xml'
++        req.headers['Accept'] = 'application/xml'
++        res = req.get_response(fakes.wsgi_app())
++
++        self.assertEqual(res.status_int, 200)
++        dom = minidom.parseString(res.body)
++        backup_detail = dom.getElementsByTagName('backup')
++
++        self.assertEqual(backup_detail.item(0).attributes.length, 11)
++        self.assertEqual(
++                backup_detail.item(0).getAttribute('availability_zone'), 'az1')
++        self.assertEqual(
++            backup_detail.item(0).getAttribute('container'), 'volumebackups')
++        self.assertEqual(
++            backup_detail.item(0).getAttribute('description'),
++            'this is a test backup')
++        self.assertEqual(
++            backup_detail.item(0).getAttribute('name'), 'test_backup')
++        self.assertEqual(
++            backup_detail.item(0).getAttribute('id'), backup_id1)
++        self.assertEqual(
++                int(backup_detail.item(0).getAttribute('object_count')), 0)
++        self.assertEqual(
++                int(backup_detail.item(0).getAttribute('size')), 0)
++        self.assertEqual(
++            backup_detail.item(0).getAttribute('status'), 'creating')
++        self.assertEqual(
++                int(backup_detail.item(0).getAttribute('volume_id')), 1)
++
++        self.assertEqual(backup_detail.item(1).attributes.length, 11)
++        self.assertEqual(
++                backup_detail.item(1).getAttribute('availability_zone'), 'az1')
++        self.assertEqual(
++            backup_detail.item(1).getAttribute('container'), 'volumebackups')
++        self.assertEqual(
++            backup_detail.item(1).getAttribute('description'),
++            'this is a test backup')
++        self.assertEqual(
++            backup_detail.item(1).getAttribute('name'), 'test_backup')
++        self.assertEqual(
++            backup_detail.item(1).getAttribute('id'), backup_id2)
++        self.assertEqual(
++            int(backup_detail.item(1).getAttribute('object_count')), 0)
++        self.assertEqual(
++            int(backup_detail.item(1).getAttribute('size')), 0)
++        self.assertEqual(
++            backup_detail.item(1).getAttribute('status'), 'creating')
++        self.assertEqual(
++            int(backup_detail.item(1).getAttribute('volume_id')), 1)
++
++        self.assertEqual(backup_detail.item(2).attributes.length, 11)
++        self.assertEqual(
++            backup_detail.item(2).getAttribute('availability_zone'), 'az1')
++        self.assertEqual(
++            backup_detail.item(2).getAttribute('container'), 'volumebackups')
++        self.assertEqual(
++            backup_detail.item(2).getAttribute('description'),
++            'this is a test backup')
++        self.assertEqual(
++            backup_detail.item(2).getAttribute('name'), 'test_backup')
++        self.assertEqual(
++            backup_detail.item(2).getAttribute('id'), backup_id3)
++        self.assertEqual(
++                int(backup_detail.item(2).getAttribute('object_count')), 0)
++        self.assertEqual(
++                int(backup_detail.item(2).getAttribute('size')), 0)
++        self.assertEqual(
++            backup_detail.item(2).getAttribute('status'), 'creating')
++        self.assertEqual(
++                int(backup_detail.item(2).getAttribute('volume_id')), 1)
++
++        db.backup_destroy(context.get_admin_context(), backup_id3)
++        db.backup_destroy(context.get_admin_context(), backup_id2)
++        db.backup_destroy(context.get_admin_context(), backup_id1)
++
++    def test_create_backup_json(self):
++        volume_id = self._create_volume(status='available', size=5)
++        body = {"backup": {"display_name": "nightly001",
++                           "display_description":
++                           "Nightly Backup 03-Sep-2012",
++                           "volume_id": volume_id,
++                           "container": "nightlybackups",
++                           }
++                }
++        req = webob.Request.blank('/v2/fake/backups')
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++
++        res_dict = json.loads(res.body)
++        LOG.info(res_dict)
++
++        self.assertEqual(res.status_int, 202)
++        self.assertTrue('id' in res_dict['backup'])
++
++        db.volume_destroy(context.get_admin_context(), volume_id)
++
++    def test_create_backup_xml(self):
++        volume_size = 2
++        volume_id = self._create_volume(status='available', size=volume_size)
++
++        req = webob.Request.blank('/v2/fake/backups')
++        req.body = ('<backup display_name="backup-001" '
++                    'display_description="Nightly Backup" '
++                    'volume_id="%s" container="Container001"/>' % volume_id)
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/xml'
++        req.headers['Accept'] = 'application/xml'
++        res = req.get_response(fakes.wsgi_app())
++
++        self.assertEqual(res.status_int, 202)
++        dom = minidom.parseString(res.body)
++        backup = dom.getElementsByTagName('backup')
++        self.assertTrue(backup.item(0).hasAttribute('id'))
++
++        db.volume_destroy(context.get_admin_context(), volume_id)
++
++    def test_create_backup_with_no_body(self):
++        # omit body from the request
++        req = webob.Request.blank('/v2/fake/backups')
++        req.body = json.dumps(None)
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.headers['Accept'] = 'application/json'
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 422)
++        self.assertEqual(res_dict['computeFault']['code'], 422)
++        self.assertEqual(res_dict['computeFault']['message'],
++                         'Unable to process the contained instructions')
++
++    def test_create_backup_with_body_KeyError(self):
++        # omit volume_id from body
++        body = {"backup": {"display_name": "nightly001",
++                           "display_description":
++                           "Nightly Backup 03-Sep-2012",
++                           "container": "nightlybackups",
++                           }
++                }
++        req = webob.Request.blank('/v2/fake/backups')
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 400)
++        self.assertEqual(res_dict['badRequest']['code'], 400)
++        self.assertEqual(res_dict['badRequest']['message'],
++                         'Incorrect request body format')
++
++    def test_create_backup_with_VolumeNotFound(self):
++        body = {"backup": {"display_name": "nightly001",
++                           "display_description":
++                           "Nightly Backup 03-Sep-2012",
++                           "volume_id": 9999,
++                           "container": "nightlybackups",
++                           }
++                }
++        req = webob.Request.blank('/v2/fake/backups')
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 404)
++        self.assertEqual(res_dict['itemNotFound']['code'], 404)
++        self.assertEqual(res_dict['itemNotFound']['message'],
++                         'Volume 9999 could not be found.')
++
++    def test_create_backup_with_InvalidVolume(self):
++        # need to create the volume referenced below first
++        volume_size = 5
++        volume_id = self._create_volume(status='restoring', size=volume_size)
++
++        body = {"backup": {"display_name": "nightly001",
++                           "display_description":
++                           "Nightly Backup 03-Sep-2012",
++                           "volume_id": volume_id,
++                           "container": "nightlybackups",
++                           }
++                }
++        req = webob.Request.blank('/v2/fake/backups')
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 400)
++        self.assertEqual(res_dict['badRequest']['code'], 400)
++        self.assertEqual(res_dict['badRequest']['message'],
++                         'Invalid volume: Volume to be backed up must'
++                         ' be available')
++
++    def test_delete_backup_available(self):
++        backup_id = self._create_backup(status='available')
++        req = webob.Request.blank('/v2/fake/backups/%s' %
++                                  backup_id)
++        req.method = 'DELETE'
++        req.headers['Content-Type'] = 'application/json'
++        res = req.get_response(fakes.wsgi_app())
++
++        self.assertEqual(res.status_int, 202)
++        self.assertEqual(self._get_backup_attrib(backup_id, 'status'),
++                         'deleting')
++
++        db.backup_destroy(context.get_admin_context(), backup_id)
++
++    def test_delete_backup_error(self):
++        backup_id = self._create_backup(status='error')
++        req = webob.Request.blank('/v2/fake/backups/%s' %
++                                  backup_id)
++        req.method = 'DELETE'
++        req.headers['Content-Type'] = 'application/json'
++        res = req.get_response(fakes.wsgi_app())
++
++        self.assertEqual(res.status_int, 202)
++        self.assertEqual(self._get_backup_attrib(backup_id, 'status'),
++                         'deleting')
++
++        db.backup_destroy(context.get_admin_context(), backup_id)
++
++    def test_delete_backup_with_backup_NotFound(self):
++        req = webob.Request.blank('/v2/fake/backups/9999')
++        req.method = 'DELETE'
++        req.headers['Content-Type'] = 'application/json'
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 404)
++        self.assertEqual(res_dict['itemNotFound']['code'], 404)
++        self.assertEqual(res_dict['itemNotFound']['message'],
++                         'Backup 9999 could not be found.')
++
++    def test_delete_backup_with_InvalidBackup(self):
++        backup_id = self._create_backup()
++        req = webob.Request.blank('/v2/fake/backups/%s' %
++                                  backup_id)
++        req.method = 'DELETE'
++        req.headers['Content-Type'] = 'application/json'
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 400)
++        self.assertEqual(res_dict['badRequest']['code'], 400)
++        self.assertEqual(res_dict['badRequest']['message'],
++                         'Invalid backup: Backup status must be '
++                         'available or error')
++
++        db.backup_destroy(context.get_admin_context(), backup_id)
++
++    def test_restore_backup_volume_id_specified_json(self):
++        backup_id = self._create_backup(status='available')
++        # need to create the volume referenced below first
++        volume_size = 5
++        volume_id = self._create_volume(status='available', size=volume_size)
++
++        body = {"restore": {"volume_id": volume_id, }}
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 202)
++        self.assertEqual(res_dict['restore']['backup_id'], backup_id)
++        self.assertEqual(res_dict['restore']['volume_id'], volume_id)
++
++    def test_restore_backup_volume_id_specified_xml(self):
++        backup_id = self._create_backup(status='available')
++        volume_size = 2
++        volume_id = self._create_volume(status='available', size=volume_size)
++
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' % backup_id)
++        req.body = '<restore volume_id="%s"/>' % volume_id
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/xml'
++        req.headers['Accept'] = 'application/xml'
++        res = req.get_response(fakes.wsgi_app())
++
++        self.assertEqual(res.status_int, 202)
++        dom = minidom.parseString(res.body)
++        restore = dom.getElementsByTagName('restore')
++        self.assertEqual(restore.item(0).getAttribute('backup_id'),
++                         backup_id)
++        self.assertEqual(restore.item(0).getAttribute('volume_id'), volume_id)
++
++        db.backup_destroy(context.get_admin_context(), backup_id)
++        db.volume_destroy(context.get_admin_context(), volume_id)
++
++    def test_restore_backup_with_no_body(self):
++        # omit body from the request
++        backup_id = self._create_backup(status='available')
++
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++        req.body = json.dumps(None)
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.headers['Accept'] = 'application/json'
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 422)
++        self.assertEqual(res_dict['computeFault']['code'], 422)
++        self.assertEqual(res_dict['computeFault']['message'],
++                         'Unable to process the contained instructions')
++
++        db.backup_destroy(context.get_admin_context(), backup_id)
++
++    def test_restore_backup_with_body_KeyError(self):
++        # omit restore from body
++        backup_id = self._create_backup(status='available')
++
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' % backup_id)
++        body = {"": {}}
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.headers['Accept'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 422)
++        self.assertEqual(res_dict['computeFault']['code'], 422)
++        self.assertEqual(res_dict['computeFault']['message'],
++                         'Unable to process the contained instructions')
++
++    def test_restore_backup_volume_id_unspecified(self):
++
++        # intercept volume creation to ensure created volume
++        # has status of available
++        def fake_volume_api_create(cls, context, size, name, description):
++            volume_id = self._create_volume(status='available', size=size)
++            return db.volume_get(context, volume_id)
++
++        self.stubs.Set(cinder.volume.API, 'create',
++                       fake_volume_api_create)
++
++        backup_id = self._create_backup(size=5, status='available')
++
++        body = {"restore": {}}
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 202)
++        self.assertEqual(res_dict['restore']['backup_id'], backup_id)
++
++    def test_restore_backup_with_InvalidInput(self):
++
++        def fake_backup_api_restore_throwing_InvalidInput(cls, context,
++                                                          backup_id,
++                                                          volume_id):
++            msg = _("Invalid input")
++            raise exception.InvalidInput(reason=msg)
++
++        self.stubs.Set(cinder.backup.API, 'restore',
++                       fake_backup_api_restore_throwing_InvalidInput)
++
++        backup_id = self._create_backup(status='available')
++        # need to create the volume referenced below first
++        volume_size = 0
++        volume_id = self._create_volume(status='available', size=volume_size)
++
++        body = {"restore": {"volume_id": volume_id, }}
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 400)
++        self.assertEqual(res_dict['badRequest']['code'], 400)
++        self.assertEqual(res_dict['badRequest']['message'],
++                         'Invalid input received: Invalid input')
++
++    def test_restore_backup_with_InvalidVolume(self):
++        backup_id = self._create_backup(status='available')
++        # need to create the volume referenced below first
++        volume_size = 5
++        volume_id = self._create_volume(status='attaching', size=volume_size)
++
++        body = {"restore": {"volume_id": volume_id, }}
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 400)
++        self.assertEqual(res_dict['badRequest']['code'], 400)
++        self.assertEqual(res_dict['badRequest']['message'],
++                         'Invalid volume: Volume to be restored to must '
++                         'be available')
++
++        db.volume_destroy(context.get_admin_context(), volume_id)
++        db.backup_destroy(context.get_admin_context(), backup_id)
++
++    def test_restore_backup_with_InvalidBackup(self):
++        backup_id = self._create_backup(status='restoring')
++        # need to create the volume referenced below first
++        volume_size = 5
++        volume_id = self._create_volume(status='available', size=volume_size)
++
++        body = {"restore": {"volume_id": volume_id, }}
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 400)
++        self.assertEqual(res_dict['badRequest']['code'], 400)
++        self.assertEqual(res_dict['badRequest']['message'],
++                         'Invalid backup: Backup status must be available')
++
++        db.volume_destroy(context.get_admin_context(), volume_id)
++        db.backup_destroy(context.get_admin_context(), backup_id)
++
++    def test_restore_backup_with_BackupNotFound(self):
++        # need to create the volume referenced below first
++        volume_size = 5
++        volume_id = self._create_volume(status='available', size=volume_size)
++
++        body = {"restore": {"volume_id": volume_id, }}
++        req = webob.Request.blank('/v2/fake/backups/9999/restore')
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 404)
++        self.assertEqual(res_dict['itemNotFound']['code'], 404)
++        self.assertEqual(res_dict['itemNotFound']['message'],
++                         'Backup 9999 could not be found.')
++
++        db.volume_destroy(context.get_admin_context(), volume_id)
++
++    def test_restore_backup_with_VolumeNotFound(self):
++        backup_id = self._create_backup(status='available')
++
++        body = {"restore": {"volume_id": "9999", }}
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 404)
++        self.assertEqual(res_dict['itemNotFound']['code'], 404)
++        self.assertEqual(res_dict['itemNotFound']['message'],
++                         'Volume 9999 could not be found.')
++
++        db.backup_destroy(context.get_admin_context(), backup_id)
++
++    def test_restore_backup_with_VolumeSizeExceedsAvailableQuota(self):
++
++        def fake_backup_api_restore_throwing_VolumeSizeExceedsAvailableQuota(
++                cls, context, backup_id, volume_id):
++            raise exception.VolumeSizeExceedsAvailableQuota()
++
++        self.stubs.Set(
++            cinder.backup.API,
++            'restore',
++            fake_backup_api_restore_throwing_VolumeSizeExceedsAvailableQuota)
++
++        backup_id = self._create_backup(status='available')
++        # need to create the volume referenced below first
++        volume_size = 5
++        volume_id = self._create_volume(status='available', size=volume_size)
++
++        body = {"restore": {"volume_id": volume_id, }}
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 413)
++        self.assertEqual(res_dict['overLimit']['code'], 413)
++        self.assertEqual(res_dict['overLimit']['message'],
++                         'Requested volume exceeds allowed volume size quota')
++
++    def test_restore_backup_with_VolumeLimitExceeded(self):
++
++        def fake_backup_api_restore_throwing_VolumeLimitExceeded(cls,
++                                                                 context,
++                                                                 backup_id,
++                                                                 volume_id):
++            raise exception.VolumeLimitExceeded(allowed=1)
++
++        self.stubs.Set(cinder.backup.API, 'restore',
++                       fake_backup_api_restore_throwing_VolumeLimitExceeded)
++
++        backup_id = self._create_backup(status='available')
++        # need to create the volume referenced below first
++        volume_size = 5
++        volume_id = self._create_volume(status='available', size=volume_size)
++
++        body = {"restore": {"volume_id": volume_id, }}
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 413)
++        self.assertEqual(res_dict['overLimit']['code'], 413)
++        self.assertEqual(res_dict['overLimit']['message'],
++                         'Maximum number of volumes allowed '
++                         '(%(allowed)d) exceeded')
++
++    def test_restore_backup_to_undersized_volume(self):
++        backup_size = 10
++        backup_id = self._create_backup(status='available', size=backup_size)
++        # need to create the volume referenced below first
++        volume_size = 5
++        volume_id = self._create_volume(status='available', size=volume_size)
++
++        body = {"restore": {"volume_id": volume_id, }}
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 400)
++        self.assertEqual(res_dict['badRequest']['code'], 400)
++        self.assertEqual(res_dict['badRequest']['message'],
++                         'Invalid volume: volume size %d is too '
++                         'small to restore backup of size %d.'
++                         % (volume_size, backup_size))
++
++        db.volume_destroy(context.get_admin_context(), volume_id)
++        db.backup_destroy(context.get_admin_context(), backup_id)
++
++    def test_restore_backup_to_oversized_volume(self):
++        backup_id = self._create_backup(status='available', size=10)
++        # need to create the volume referenced below first
++        volume_size = 15
++        volume_id = self._create_volume(status='available', size=volume_size)
++
++        body = {"restore": {"volume_id": volume_id, }}
++        req = webob.Request.blank('/v2/fake/backups/%s/restore' %
++                                  backup_id)
++        req.method = 'POST'
++        req.headers['Content-Type'] = 'application/json'
++        req.body = json.dumps(body)
++        res = req.get_response(fakes.wsgi_app())
++        res_dict = json.loads(res.body)
++
++        self.assertEqual(res.status_int, 202)
++        self.assertEqual(res_dict['restore']['backup_id'], backup_id)
++        self.assertEqual(res_dict['restore']['volume_id'], volume_id)
++
++        db.volume_destroy(context.get_admin_context(), volume_id)
++        db.backup_destroy(context.get_admin_context(), backup_id)
+diff --git a/cinder/tests/backup/__init__.py b/cinder/tests/backup/__init__.py
+new file mode 100644
+index 0000000..cdf1b48
+--- /dev/null
++++ b/cinder/tests/backup/__init__.py
+@@ -0,0 +1,14 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
+diff --git a/cinder/tests/backup/fake_service.py b/cinder/tests/backup/fake_service.py
+new file mode 100644
+index 0000000..c8a182e
+--- /dev/null
++++ b/cinder/tests/backup/fake_service.py
+@@ -0,0 +1,41 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from cinder.db import base
++from cinder.openstack.common import log as logging
++
++LOG = logging.getLogger(__name__)
++
++
++class FakeBackupService(base.Base):
++    def __init__(self, context, db_driver=None):
++        super(FakeBackupService, self).__init__(db_driver)
++
++    def backup(self, backup, volume_file):
++        pass
++
++    def restore(self, backup, volume_id, volume_file):
++        pass
++
++    def delete(self, backup):
++        # if backup has magic name of 'fail_on_delete'
++        # we raise an error - useful for some tests -
++        # otherwise we return without error
++        if backup['display_name'] == 'fail_on_delete':
++            raise IOError('fake')
++
++
++def get_backup_service(context):
++    return FakeBackupService(context)
+diff --git a/cinder/tests/backup/fake_swift_client.py b/cinder/tests/backup/fake_swift_client.py
+new file mode 100644
+index 0000000..66ef167
+--- /dev/null
++++ b/cinder/tests/backup/fake_swift_client.py
+@@ -0,0 +1,99 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import httplib
++import json
++import os
++import zlib
++
++from cinder.openstack.common import log as logging
++from swiftclient import client as swift
++
++LOG = logging.getLogger(__name__)
++
++
++class FakeSwiftClient(object):
++    """Logs calls instead of executing."""
++    def __init__(self, *args, **kwargs):
++        pass
++
++    @classmethod
++    def Connection(self, *args, **kargs):
++        LOG.debug("fake FakeSwiftClient Connection")
++        return FakeSwiftConnection()
++
++
++class FakeSwiftConnection(object):
++    """Logging calls instead of executing"""
++    def __init__(self, *args, **kwargs):
++        pass
++
++    def head_container(self, container):
++        LOG.debug("fake head_container(%s)" % container)
++        if container == 'missing_container':
++            raise swift.ClientException('fake exception',
++                                        http_status=httplib.NOT_FOUND)
++        if container == 'unauthorized_container':
++            raise swift.ClientException('fake exception',
++                                        http_status=httplib.UNAUTHORIZED)
++        pass
++
++    def put_container(self, container):
++        LOG.debug("fake put_container(%s)" % container)
++        pass
++
++    def get_container(self, container, **kwargs):
++        LOG.debug("fake get_container(%s)" % container)
++        fake_header = None
++        fake_body = [{'name': 'backup_001'},
++                     {'name': 'backup_002'},
++                     {'name': 'backup_003'}]
++        return fake_header, fake_body
++
++    def head_object(self, container, name):
++        LOG.debug("fake put_container(%s, %s)" % (container, name))
++        return {'etag': 'fake-md5-sum'}
++
++    def get_object(self, container, name):
++        LOG.debug("fake get_object(%s, %s)" % (container, name))
++        if 'metadata' in name:
++            fake_object_header = None
++            metadata = {}
++            metadata['version'] = '1.0.0'
++            metadata['backup_id'] = 123
++            metadata['volume_id'] = 123
++            metadata['backup_name'] = 'fake backup'
++            metadata['backup_description'] = 'fake backup description'
++            metadata['created_at'] = '2013-02-19 11:20:54,805'
++            metadata['objects'] = [{
++                'backup_001': {'compression': 'zlib', 'length': 10},
++                'backup_002': {'compression': 'zlib', 'length': 10},
++                'backup_003': {'compression': 'zlib', 'length': 10}
++            }]
++            metadata_json = json.dumps(metadata, sort_keys=True, indent=2)
++            fake_object_body = metadata_json
++            return (fake_object_header, fake_object_body)
++
++        fake_header = None
++        fake_object_body = os.urandom(1024 * 1024)
++        return (fake_header, zlib.compress(fake_object_body))
++
++    def put_object(self, container, name, reader):
++        LOG.debug("fake put_object(%s, %s)" % (container, name))
++        return 'fake-md5-sum'
++
++    def delete_object(self, container, name):
++        LOG.debug("fake delete_object(%s, %s)" % (container, name))
++        pass
+diff --git a/cinder/tests/fake_flags.py b/cinder/tests/fake_flags.py
+index 1bc647d..900ea4b 100644
+--- a/cinder/tests/fake_flags.py
++++ b/cinder/tests/fake_flags.py
+@@ -24,6 +24,7 @@ flags.DECLARE('iscsi_num_targets', 'cinder.volume.drivers.lvm')
+ flags.DECLARE('policy_file', 'cinder.policy')
+ flags.DECLARE('volume_driver', 'cinder.volume.manager')
+ flags.DECLARE('xiv_proxy', 'cinder.volume.drivers.xiv')
++flags.DECLARE('backup_service', 'cinder.backup.manager')
+ 
+ def_vol_type = 'fake_vol_type'
+ 
+@@ -42,3 +43,4 @@ def set_defaults(conf):
+     conf.set_default('sqlite_synchronous', False)
+     conf.set_default('policy_file', 'cinder/tests/policy.json')
+     conf.set_default('xiv_proxy', 'cinder.tests.test_xiv.XIVFakeProxyDriver')
++    conf.set_default('backup_service', 'cinder.tests.backup.fake_service')
+diff --git a/cinder/tests/test_backup.py b/cinder/tests/test_backup.py
+new file mode 100644
+index 0000000..b97a76f
+--- /dev/null
++++ b/cinder/tests/test_backup.py
+@@ -0,0 +1,332 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++"""
++Tests for Backup code.
++
++"""
++
++import tempfile
++
++from cinder import context
++from cinder import db
++from cinder import exception
++from cinder import flags
++from cinder.openstack.common import importutils
++from cinder.openstack.common import log as logging
++from cinder import test
++
++FLAGS = flags.FLAGS
++LOG = logging.getLogger(__name__)
++
++
++class FakeBackupException(Exception):
++        pass
++
++
++class BackupTestCase(test.TestCase):
++    """Test Case for backups."""
++
++    def setUp(self):
++        super(BackupTestCase, self).setUp()
++        vol_tmpdir = tempfile.mkdtemp()
++        self.flags(connection_type='fake',
++                   volumes_dir=vol_tmpdir)
++        self.backup_mgr = \
++            importutils.import_object(FLAGS.backup_manager)
++        self.backup_mgr.host = 'testhost'
++        self.ctxt = context.get_admin_context()
++
++    def tearDown(self):
++        super(BackupTestCase, self).tearDown()
++
++    def _create_backup_db_entry(self, volume_id=1, display_name='test_backup',
++                                display_description='this is a test backup',
++                                container='volumebackups',
++                                status='creating',
++                                size=0,
++                                object_count=0):
++        """
++        Create a backup entry in the DB.
++        Return the entry ID
++        """
++        backup = {}
++        backup['volume_id'] = volume_id
++        backup['user_id'] = 'fake'
++        backup['project_id'] = 'fake'
++        backup['host'] = 'testhost'
++        backup['availability_zone'] = '1'
++        backup['display_name'] = display_name
++        backup['display_description'] = display_description
++        backup['container'] = container
++        backup['status'] = status
++        backup['fail_reason'] = ''
++        backup['service'] = FLAGS.backup_service
++        backup['size'] = size
++        backup['object_count'] = object_count
++        return db.backup_create(self.ctxt, backup)['id']
++
++    def _create_volume_db_entry(self, display_name='test_volume',
++                                display_description='this is a test volume',
++                                status='backing-up',
++                                size=1):
++        """
++        Create a volume entry in the DB.
++        Return the entry ID
++        """
++        vol = {}
++        vol['size'] = size
++        vol['host'] = 'testhost'
++        vol['user_id'] = 'fake'
++        vol['project_id'] = 'fake'
++        vol['status'] = status
++        vol['display_name'] = display_name
++        vol['display_description'] = display_description
++        vol['attach_status'] = 'detached'
++        return db.volume_create(self.ctxt, vol)['id']
++
++    def test_init_host(self):
++        """Make sure stuck volumes and backups are reset to correct
++        states when backup_manager.init_host() is called"""
++        vol1_id = self._create_volume_db_entry(status='backing-up')
++        vol2_id = self._create_volume_db_entry(status='restoring-backup')
++        backup1_id = self._create_backup_db_entry(status='creating')
++        backup2_id = self._create_backup_db_entry(status='restoring')
++        backup3_id = self._create_backup_db_entry(status='deleting')
++
++        self.backup_mgr.init_host()
++        vol1 = db.volume_get(self.ctxt, vol1_id)
++        self.assertEquals(vol1['status'], 'available')
++        vol2 = db.volume_get(self.ctxt, vol2_id)
++        self.assertEquals(vol2['status'], 'error_restoring')
++
++        backup1 = db.backup_get(self.ctxt, backup1_id)
++        self.assertEquals(backup1['status'], 'error')
++        backup2 = db.backup_get(self.ctxt, backup2_id)
++        self.assertEquals(backup2['status'], 'available')
++        self.assertRaises(exception.BackupNotFound,
++                          db.backup_get,
++                          self.ctxt,
++                          backup3_id)
++
++    def test_create_backup_with_bad_volume_status(self):
++        """Test error handling when creating a backup from a volume
++        with a bad status"""
++        vol_id = self._create_volume_db_entry(status='available', size=1)
++        backup_id = self._create_backup_db_entry(volume_id=vol_id)
++        self.assertRaises(exception.InvalidVolume,
++                          self.backup_mgr.create_backup,
++                          self.ctxt,
++                          backup_id)
++
++    def test_create_backup_with_bad_backup_status(self):
++        """Test error handling when creating a backup with a backup
++        with a bad status"""
++        vol_id = self._create_volume_db_entry(size=1)
++        backup_id = self._create_backup_db_entry(status='available',
++                                                 volume_id=vol_id)
++        self.assertRaises(exception.InvalidBackup,
++                          self.backup_mgr.create_backup,
++                          self.ctxt,
++                          backup_id)
++
++    def test_create_backup_with_error(self):
++        """Test error handling when an error occurs during backup creation"""
++        vol_id = self._create_volume_db_entry(size=1)
++        backup_id = self._create_backup_db_entry(volume_id=vol_id)
++
++        def fake_backup_volume(context, backup, backup_service):
++            raise FakeBackupException('fake')
++
++        self.stubs.Set(self.backup_mgr.driver, 'backup_volume',
++                       fake_backup_volume)
++
++        self.assertRaises(FakeBackupException,
++                          self.backup_mgr.create_backup,
++                          self.ctxt,
++                          backup_id)
++        vol = db.volume_get(self.ctxt, vol_id)
++        self.assertEquals(vol['status'], 'available')
++        backup = db.backup_get(self.ctxt, backup_id)
++        self.assertEquals(backup['status'], 'error')
++
++    def test_create_backup(self):
++        """Test normal backup creation"""
++        vol_size = 1
++        vol_id = self._create_volume_db_entry(size=vol_size)
++        backup_id = self._create_backup_db_entry(volume_id=vol_id)
++
++        def fake_backup_volume(context, backup, backup_service):
++            pass
++
++        self.stubs.Set(self.backup_mgr.driver, 'backup_volume',
++                       fake_backup_volume)
++
++        self.backup_mgr.create_backup(self.ctxt, backup_id)
++        vol = db.volume_get(self.ctxt, vol_id)
++        self.assertEquals(vol['status'], 'available')
++        backup = db.backup_get(self.ctxt, backup_id)
++        self.assertEquals(backup['status'], 'available')
++        self.assertEqual(backup['size'], vol_size)
++
++    def test_restore_backup_with_bad_volume_status(self):
++        """Test error handling when restoring a backup to a volume
++        with a bad status"""
++        vol_id = self._create_volume_db_entry(status='available', size=1)
++        backup_id = self._create_backup_db_entry(volume_id=vol_id)
++        self.assertRaises(exception.InvalidVolume,
++                          self.backup_mgr.restore_backup,
++                          self.ctxt,
++                          backup_id,
++                          vol_id)
++        backup = db.backup_get(self.ctxt, backup_id)
++        self.assertEquals(backup['status'], 'available')
++
++    def test_restore_backup_with_bad_backup_status(self):
++        """Test error handling when restoring a backup with a backup
++        with a bad status"""
++        vol_id = self._create_volume_db_entry(status='restoring-backup',
++                                              size=1)
++        backup_id = self._create_backup_db_entry(status='available',
++                                                 volume_id=vol_id)
++        self.assertRaises(exception.InvalidBackup,
++                          self.backup_mgr.restore_backup,
++                          self.ctxt,
++                          backup_id,
++                          vol_id)
++        vol = db.volume_get(self.ctxt, vol_id)
++        self.assertEquals(vol['status'], 'error')
++        backup = db.backup_get(self.ctxt, backup_id)
++        self.assertEquals(backup['status'], 'error')
++
++    def test_restore_backup_with_driver_error(self):
++        """Test error handling when an error occurs during backup restore"""
++        vol_id = self._create_volume_db_entry(status='restoring-backup',
++                                              size=1)
++        backup_id = self._create_backup_db_entry(status='restoring',
++                                                 volume_id=vol_id)
++
++        def fake_restore_backup(context, backup, volume, backup_service):
++            raise FakeBackupException('fake')
++
++        self.stubs.Set(self.backup_mgr.driver, 'restore_backup',
++                       fake_restore_backup)
++
++        self.assertRaises(FakeBackupException,
++                          self.backup_mgr.restore_backup,
++                          self.ctxt,
++                          backup_id,
++                          vol_id)
++        vol = db.volume_get(self.ctxt, vol_id)
++        self.assertEquals(vol['status'], 'error_restoring')
++        backup = db.backup_get(self.ctxt, backup_id)
++        self.assertEquals(backup['status'], 'available')
++
++    def test_restore_backup_with_bad_service(self):
++        """Test error handling when attempting a restore of a backup
++        with a different service to that used to create the backup"""
++        vol_id = self._create_volume_db_entry(status='restoring-backup',
++                                              size=1)
++        backup_id = self._create_backup_db_entry(status='restoring',
++                                                 volume_id=vol_id)
++
++        def fake_restore_backup(context, backup, volume, backup_service):
++            pass
++
++        self.stubs.Set(self.backup_mgr.driver, 'restore_backup',
++                       fake_restore_backup)
++
++        service = 'cinder.tests.backup.bad_service'
++        db.backup_update(self.ctxt, backup_id, {'service': service})
++        self.assertRaises(exception.InvalidBackup,
++                          self.backup_mgr.restore_backup,
++                          self.ctxt,
++                          backup_id,
++                          vol_id)
++        vol = db.volume_get(self.ctxt, vol_id)
++        self.assertEquals(vol['status'], 'error')
++        backup = db.backup_get(self.ctxt, backup_id)
++        self.assertEquals(backup['status'], 'available')
++
++    def test_restore_backup(self):
++        """Test normal backup restoration"""
++        vol_size = 1
++        vol_id = self._create_volume_db_entry(status='restoring-backup',
++                                              size=vol_size)
++        backup_id = self._create_backup_db_entry(status='restoring',
++                                                 volume_id=vol_id)
++
++        def fake_restore_backup(context, backup, volume, backup_service):
++            pass
++
++        self.stubs.Set(self.backup_mgr.driver, 'restore_backup',
++                       fake_restore_backup)
++
++        self.backup_mgr.restore_backup(self.ctxt, backup_id, vol_id)
++        vol = db.volume_get(self.ctxt, vol_id)
++        self.assertEquals(vol['status'], 'available')
++        backup = db.backup_get(self.ctxt, backup_id)
++        self.assertEquals(backup['status'], 'available')
++
++    def test_delete_backup_with_bad_backup_status(self):
++        """Test error handling when deleting a backup with a backup
++        with a bad status"""
++        vol_id = self._create_volume_db_entry(size=1)
++        backup_id = self._create_backup_db_entry(status='available',
++                                                 volume_id=vol_id)
++        self.assertRaises(exception.InvalidBackup,
++                          self.backup_mgr.delete_backup,
++                          self.ctxt,
++                          backup_id)
++        backup = db.backup_get(self.ctxt, backup_id)
++        self.assertEquals(backup['status'], 'error')
++
++    def test_delete_backup_with_error(self):
++        """Test error handling when an error occurs during backup deletion."""
++        vol_id = self._create_volume_db_entry(size=1)
++        backup_id = self._create_backup_db_entry(status='deleting',
++                                                 display_name='fail_on_delete',
++                                                 volume_id=vol_id)
++        self.assertRaises(IOError,
++                          self.backup_mgr.delete_backup,
++                          self.ctxt,
++                          backup_id)
++        backup = db.backup_get(self.ctxt, backup_id)
++        self.assertEquals(backup['status'], 'error')
++
++    def test_delete_backup_with_bad_service(self):
++        """Test error handling when attempting a delete of a backup
++        with a different service to that used to create the backup"""
++        vol_id = self._create_volume_db_entry(size=1)
++        backup_id = self._create_backup_db_entry(status='deleting',
++                                                 volume_id=vol_id)
++        service = 'cinder.tests.backup.bad_service'
++        db.backup_update(self.ctxt, backup_id, {'service': service})
++        self.assertRaises(exception.InvalidBackup,
++                          self.backup_mgr.delete_backup,
++                          self.ctxt,
++                          backup_id)
++        backup = db.backup_get(self.ctxt, backup_id)
++        self.assertEquals(backup['status'], 'available')
++
++    def test_delete_backup(self):
++        """Test normal backup deletion"""
++        vol_id = self._create_volume_db_entry(size=1)
++        backup_id = self._create_backup_db_entry(status='deleting',
++                                                 volume_id=vol_id)
++        self.backup_mgr.delete_backup(self.ctxt, backup_id)
++        self.assertRaises(exception.BackupNotFound,
++                          db.backup_get,
++                          self.ctxt,
++                          backup_id)
+diff --git a/cinder/tests/test_backup_swift.py b/cinder/tests/test_backup_swift.py
+new file mode 100644
+index 0000000..163fb5a
+--- /dev/null
++++ b/cinder/tests/test_backup_swift.py
+@@ -0,0 +1,156 @@
++# Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++"""
++Tests for Backup swift code.
++
++"""
++
++import bz2
++import hashlib
++import os
++import tempfile
++import zlib
++
++from cinder.backup.services.swift import SwiftBackupService
++from cinder import context
++from cinder import db
++from cinder import flags
++from cinder.openstack.common import log as logging
++from cinder import test
++from cinder.tests.backup.fake_swift_client import FakeSwiftClient
++from swiftclient import client as swift
++
++
++FLAGS = flags.FLAGS
++LOG = logging.getLogger(__name__)
++
++
++def fake_md5(arg):
++    class result(object):
++        def hexdigest(self):
++            return 'fake-md5-sum'
++
++    ret = result()
++    return ret
++
++
++class BackupSwiftTestCase(test.TestCase):
++    """Test Case for swift."""
++
++    def _create_volume_db_entry(self):
++        vol = {'id': '1234-5678-1234-8888',
++               'size': 1,
++               'status': 'available'}
++        return db.volume_create(self.ctxt, vol)['id']
++
++    def _create_backup_db_entry(self, container='test-container'):
++        backup = {'id': 123,
++                  'size': 1,
++                  'container': container,
++                  'volume_id': '1234-5678-1234-8888'}
++        return db.backup_create(self.ctxt, backup)['id']
++
++    def setUp(self):
++        super(BackupSwiftTestCase, self).setUp()
++        self.ctxt = context.get_admin_context()
++
++        self.stubs.Set(swift, 'Connection', FakeSwiftClient.Connection)
++        self.stubs.Set(hashlib, 'md5', fake_md5)
++
++        self._create_volume_db_entry()
++        self.volume_file = tempfile.NamedTemporaryFile()
++        for i in xrange(0, 128):
++            self.volume_file.write(os.urandom(1024))
++
++    def tearDown(self):
++        self.volume_file.close()
++        super(BackupSwiftTestCase, self).tearDown()
++
++    def test_backup_uncompressed(self):
++        self._create_backup_db_entry()
++        self.flags(backup_compression_algorithm='none')
++        service = SwiftBackupService(self.ctxt)
++        self.volume_file.seek(0)
++        backup = db.backup_get(self.ctxt, 123)
++        service.backup(backup, self.volume_file)
++
++    def test_backup_bz2(self):
++        self._create_backup_db_entry()
++        self.flags(backup_compression_algorithm='bz2')
++        service = SwiftBackupService(self.ctxt)
++        self.volume_file.seek(0)
++        backup = db.backup_get(self.ctxt, 123)
++        service.backup(backup, self.volume_file)
++
++    def test_backup_zlib(self):
++        self._create_backup_db_entry()
++        self.flags(backup_compression_algorithm='zlib')
++        service = SwiftBackupService(self.ctxt)
++        self.volume_file.seek(0)
++        backup = db.backup_get(self.ctxt, 123)
++        service.backup(backup, self.volume_file)
++
++    def test_backup_default_container(self):
++        self._create_backup_db_entry(container=None)
++        service = SwiftBackupService(self.ctxt)
++        self.volume_file.seek(0)
++        backup = db.backup_get(self.ctxt, 123)
++        service.backup(backup, self.volume_file)
++        backup = db.backup_get(self.ctxt, 123)
++        self.assertEquals(backup['container'], 'volumebackups')
++
++    def test_backup_custom_container(self):
++        container_name = 'fake99'
++        self._create_backup_db_entry(container=container_name)
++        service = SwiftBackupService(self.ctxt)
++        self.volume_file.seek(0)
++        backup = db.backup_get(self.ctxt, 123)
++        service.backup(backup, self.volume_file)
++        backup = db.backup_get(self.ctxt, 123)
++        self.assertEquals(backup['container'], container_name)
++
++    def test_restore(self):
++        self._create_backup_db_entry()
++        service = SwiftBackupService(self.ctxt)
++
++        with tempfile.NamedTemporaryFile() as volume_file:
++            backup = db.backup_get(self.ctxt, 123)
++            service.restore(backup, '1234-5678-1234-8888', volume_file)
++
++    def test_delete(self):
++        self._create_backup_db_entry()
++        service = SwiftBackupService(self.ctxt)
++        backup = db.backup_get(self.ctxt, 123)
++        service.delete(backup)
++
++    def test_get_compressor(self):
++        service = SwiftBackupService(self.ctxt)
++        compressor = service._get_compressor('None')
++        self.assertEquals(compressor, None)
++        compressor = service._get_compressor('zlib')
++        self.assertEquals(compressor, zlib)
++        compressor = service._get_compressor('bz2')
++        self.assertEquals(compressor, bz2)
++        self.assertRaises(ValueError, service._get_compressor, 'fake')
++
++    def test_check_container_exists(self):
++        service = SwiftBackupService(self.ctxt)
++        exists = service._check_container_exists('fake_container')
++        self.assertEquals(exists, True)
++        exists = service._check_container_exists('missing_container')
++        self.assertEquals(exists, False)
++        self.assertRaises(swift.ClientException,
++                          service._check_container_exists,
++                          'unauthorized_container')
+diff --git a/cinder/tests/test_migrations.py b/cinder/tests/test_migrations.py
+index 936bd7a..f50ef7f 100644
+--- a/cinder/tests/test_migrations.py
++++ b/cinder/tests/test_migrations.py
+@@ -523,3 +523,65 @@ class TestMigrations(test.TestCase):
+             snapshots = sqlalchemy.Table('snapshots', metadata, autoload=True)
+ 
+             self.assertEquals(0, len(snapshots.c.volume_id.foreign_keys))
++
++    def test_migration_008(self):
++        """Test that adding and removing the backups table works correctly"""
++        for (key, engine) in self.engines.items():
++            migration_api.version_control(engine,
++                                          TestMigrations.REPOSITORY,
++                                          migration.INIT_VERSION)
++            migration_api.upgrade(engine, TestMigrations.REPOSITORY, 7)
++            metadata = sqlalchemy.schema.MetaData()
++            metadata.bind = engine
++
++            migration_api.upgrade(engine, TestMigrations.REPOSITORY, 8)
++
++            self.assertTrue(engine.dialect.has_table(engine.connect(),
++                                                     "backups"))
++            backups = sqlalchemy.Table('backups',
++                                       metadata,
++                                       autoload=True)
++
++            self.assertTrue(isinstance(backups.c.created_at.type,
++                                       sqlalchemy.types.DATETIME))
++            self.assertTrue(isinstance(backups.c.updated_at.type,
++                                       sqlalchemy.types.DATETIME))
++            self.assertTrue(isinstance(backups.c.deleted_at.type,
++                                       sqlalchemy.types.DATETIME))
++            self.assertTrue(isinstance(backups.c.deleted.type,
++                                       sqlalchemy.types.BOOLEAN))
++            self.assertTrue(isinstance(backups.c.id.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.volume_id.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.user_id.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.project_id.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.host.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.availability_zone.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.display_name.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.display_description.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.container.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.status.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.fail_reason.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.service_metadata.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.service.type,
++                                       sqlalchemy.types.VARCHAR))
++            self.assertTrue(isinstance(backups.c.size.type,
++                                       sqlalchemy.types.INTEGER))
++            self.assertTrue(isinstance(backups.c.object_count.type,
++                                       sqlalchemy.types.INTEGER))
++
++            migration_api.downgrade(engine, TestMigrations.REPOSITORY, 7)
++
++            self.assertFalse(engine.dialect.has_table(engine.connect(),
++                                                      "backups"))
+diff --git a/cinder/volume/api.py b/cinder/volume/api.py
+index e076822..285afa2 100644
+--- a/cinder/volume/api.py
++++ b/cinder/volume/api.py
+@@ -295,7 +295,8 @@ class API(base.Base):
+             if reservations:
+                 QUOTAS.commit(context, reservations)
+             return
+-        if not force and volume['status'] not in ["available", "error"]:
++        if not force and volume['status'] not in ["available", "error",
++                                                  "error_restoring"]:
+             msg = _("Volume status must be available or error")
+             raise exception.InvalidVolume(reason=msg)
+ 
+diff --git a/cinder/volume/driver.py b/cinder/volume/driver.py
+index 670ba29..183d6c8 100644
+--- a/cinder/volume/driver.py
++++ b/cinder/volume/driver.py
+@@ -185,6 +185,14 @@ class VolumeDriver(object):
+         """
+         return False
+ 
++    def backup_volume(self, context, backup, backup_service):
++        """Create a new backup from an existing volume."""
++        raise NotImplementedError()
++
++    def restore_backup(self, context, backup, volume, backup_service):
++        """Restore an existing backup to a new or existing volume."""
++        raise NotImplementedError()
++
+ 
+ class ISCSIDriver(VolumeDriver):
+     """Executes commands relating to ISCSI volumes.
+diff --git a/cinder/volume/drivers/lvm.py b/cinder/volume/drivers/lvm.py
+index 0e79573..9a8efe8 100644
+--- a/cinder/volume/drivers/lvm.py
++++ b/cinder/volume/drivers/lvm.py
+@@ -273,6 +273,21 @@ class LVMVolumeDriver(driver.VolumeDriver):
+     def clone_image(self, volume, image_location):
+         return False
+ 
++    def backup_volume(self, context, backup, backup_service):
++        """Create a new backup from an existing volume."""
++        volume = self.db.volume_get(context, backup['volume_id'])
++        volume_path = self.local_path(volume)
++        with utils.temporary_chown(volume_path):
++            with utils.file_open(volume_path) as volume_file:
++                backup_service.backup(backup, volume_file)
++
++    def restore_backup(self, context, backup, volume, backup_service):
++        """Restore an existing backup to a new or existing volume."""
++        volume_path = self.local_path(volume)
++        with utils.temporary_chown(volume_path):
++            with utils.file_open(volume_path, 'wb') as volume_file:
++                backup_service.restore(backup, volume['id'], volume_file)
++
+ 
+ class LVMISCSIDriver(LVMVolumeDriver, driver.ISCSIDriver):
+     """Executes commands relating to ISCSI volumes.
+diff --git a/etc/cinder/cinder.conf.sample b/etc/cinder/cinder.conf.sample
+index b44bc8c..f59e4d0 100644
+--- a/etc/cinder/cinder.conf.sample
++++ b/etc/cinder/cinder.conf.sample
+@@ -346,6 +346,9 @@
+ # (string value)
+ #snapshot_name_template=snapshot-%s
+ 
++# Template string to be used to generate backup names (string
++# value)
++#backup_name_template=backup-%s
+ 
+ #
+ # Options defined in cinder.db.base
+diff --git a/tools/pip-requires b/tools/pip-requires
+index d0d7292..91fc642 100644
+--- a/tools/pip-requires
++++ b/tools/pip-requires
+@@ -21,5 +21,6 @@ iso8601>=0.1.4
+ setuptools_git>=0.4
+ python-glanceclient>=0.5.0,<2
+ python-keystoneclient>=0.2.0
++python-swiftclient
+ rtslib>=2.1.fb27
+ http://tarballs.openstack.org/oslo-config/oslo-config-2013.1b4.tar.gz#egg=oslo-config
+-- 
+1.9.1
+

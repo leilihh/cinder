@@ -31,9 +31,9 @@ from cinder import exception
 
 LOG = logging.getLogger(__name__)
 
-3parbackup_service_opts = [
-    cfg.StrOpt('backup_3par_conf', default='/etc/3par/3par.conf',
-               help='3par configuration file to use.')
+ONestbackup_service_opts = [
+    cfg.StrOpt('backup_onest_conf', default='/etc/onest/onest.conf',
+               help='onest configuration file to use.')
 ]
 
 CONF = cfg.CONF
@@ -41,7 +41,7 @@ CONF.register_opts(service_opts)
 
 
 
-class 3PARBackupDriver(driver.BackupDriver):
+class ONestBackupDriver(driver.BackupDriver):
     """Backup Cinder 3par volumes to Onet Object Store."""
 
     def __init__(self, context, db_driver=None, execute=None):
@@ -49,18 +49,34 @@ class 3PARBackupDriver(driver.BackupDriver):
         
 
     def backup(self, backup, volume_file, backup_metadata=False):
-
+        pass
     
 
     def restore(self, backup, volume_id, volume_file):
-
+        pass
 
 
     def delete(self, backup):
+        pass
 
+    """
+    
+    def put_container(self, container):
+        pass
 
+    def get_container_entries(self, container, prefix):
+        pass
+
+    def get_object_writer(self, container, object_name, extra_metadata=None):
+        pass
+
+    def get_object_reader(self, container, object_name, extra_metadata=None):
+        pass
+
+    def delete_object(self, container, object_name):
+        pass
 
 
 def get_backup_driver(context):
-    return 3PARBackupDriver(context)
+    return ONestBackupDriver(context)
 
