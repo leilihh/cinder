@@ -997,11 +997,11 @@ class HP3PARCommon(object):
                         'readOnly': True}
             if self.config.hp3par_snapshot_expiration:
                 optional['expirationHours'] = (
-                    self.config.hp3par_snapshot_expiration)
+                    int(self.config.hp3par_snapshot_expiration))
 
             if self.config.hp3par_snapshot_retention:
                 optional['retentionHours'] = (
-                    self.config.hp3par_snapshot_retention)
+                    int(self.config.hp3par_snapshot_retention))
 
             self.client.createSnapshot(snap_name, vol_name, optional)
         except hpexceptions.HTTPForbidden as ex:
